@@ -58,14 +58,60 @@ def extract_value_after_keyword(text, keyword):
     
     return ""
 
-def extract_field_from_table(text, field_label):
-    """Extract value from table-like structure"""
-    # For fields that appear in table cells
-    pattern = rf"{re.escape(field_label)}\s+(\S+)"
-    match = re.search(pattern, text, re.IGNORECASE)
+def extract_invoice_number_and_date(text):
+    """Extract Invoice Number and Date from the header table"""
+    # Pattern to find "INVOICE No" followed by "Dated" with their values
+    # Looking for the structure: INVOICE No [value] Dated [date]
+    
+    # Try to find the line containing both INVOICE No and Dated
+    pattern = r'INVOICE\s+No\s+Dated\s*\n?\s*(\d+)\s+(\d{1,2}-[A-Za-z]{3}-\d{2,4})'
+    match = re.search(pattern, text, re.IGNORECASE | re.MULTILINE)
+    
     if match:
-        return match.group(1).strip()
-    return ""
+        return match.group(1).strip(), match.group(2).strip()
+    
+    # Alternative: Try to find them separately on consecutive lines
+    lines = text.split('\n')
+    for i, line in enumerate(lines):
+        if 'INVOICE No' in line and 'Dated' in line:
+            # Check next line for values
+            if i + 1 < len(lines):
+                next_line = lines[i + 1].strip()
+                # Try to extract invoice number and date from next line
+                parts = next_line.split()
+                if len(parts) >= 2:
+                    invoice_no = parts[0]
+                    invoice_date = parts[1] if len(parts) > 1 else ""
+                    return invoice_no, invoice_date
+    
+    # Fallback: extract separately
+    invoice_no = ""
+    invoice_date = ""
+    
+    # Extract Invoice Number
+    inv_patterns = [
+        r'INVOICE\s+No\s*[:\-]?\s*(\d+)',
+        r'Invoice\s+Number\s*[:\-]?\s*(\d+)',
+    ]
+    for pattern in inv_patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            invoice_no = match.group(1).strip()
+            break
+    
+    # Extract Date (looking for format like "12-Nov-25" or "12-Nov-2025")
+    date_patterns = [
+        r'Dated\s*[:\-]?\s*(\d{1,2}-[A-Za-z]{3}-\d{2,4})',
+        r'Date\s*[:\-]?\s*(\d{1,2}-[A-Za-z]{3}-\d{2,4})',
+        r'(\d{1,2}-[A-Za-z]{3}-\d{2,4})',  # Generic date pattern
+    ]
+    for pattern in date_patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            invoice_date = match.group(1).strip()
+            break
+    
+    return invoice_no, invoice_date
 
 def clean_amount(amount_str):
     """Clean and extract numeric amount"""
@@ -103,19 +149,12 @@ def extract_invoice_data(pdf_file):
                 # Fallback: try to get from "Account Holder" line
                 party_name = extract_value_after_keyword(full_text, "Account Holder")
             
-            # Extract Invoice Number (from table header)
-            invoice_no = extract_field_from_table(full_text, "INVOICE No")
-            if not invoice_no:
-                invoice_no = extract_value_after_keyword(full_text, "INVOICE No")
-            
-            # Extract Date (from table header)
-            invoice_date = extract_field_from_table(full_text, "Dated")
-            if not invoice_date:
-                invoice_date = extract_value_after_keyword(full_text, "Dated")
+            # Extract Invoice Number and Date (FIXED)
+            invoice_no, invoice_date = extract_invoice_number_and_date(full_text)
             
             # Extract Total Amount
             # Look for "Total" followed by amount on same or next line
-            total_pattern = r'Total\s+(\d+[,\d]*\.?\d*)'
+            total_pattern = r'Total\s+[\(\s]*(\d+[,\d]*\.?\d*)[\)\s]*'
             total_match = re.search(total_pattern, full_text, re.IGNORECASE)
             if total_match:
                 amount = total_match.group(1).replace(',', '')
@@ -126,7 +165,7 @@ def extract_invoice_data(pdf_file):
             # Extract Account Number
             account_no = extract_value_after_keyword(full_text, "Account Number")
             if not account_no:
-                # Try pattern: "Account Number: 5010024907310Z"
+                # Try pattern: "Account Number: 50100249073102"
                 acc_pattern = r'Account\s+Number\s*:\s*(\d+)'
                 acc_match = re.search(acc_pattern, full_text, re.IGNORECASE)
                 if acc_match:
@@ -157,7 +196,7 @@ def extract_invoice_data(pdf_file):
             if not gst:
                 gst = extract_value_after_keyword(full_text, "GSTIN")
             if not gst:
-                # Try pattern: "GST Tin No-06AAFCI1834E1ZX"
+                # Try pattern: "GST Tin No:-06AAFCI1834E1ZX"
                 gst_pattern = r'GST\s+Tin\s+No[-:\s]*([A-Z0-9]+)'
                 gst_match = re.search(gst_pattern, full_text, re.IGNORECASE)
                 if gst_match:
