@@ -60,38 +60,46 @@ def extract_value_after_keyword(text, keyword):
 
 def extract_invoice_number_and_date(text):
     """Extract Invoice Number and Date from the header table"""
-    # Pattern to find "INVOICE No" followed by "Dated" with their values
-    # Looking for the structure: INVOICE No [value] Dated [date]
+    # The invoice has this structure:
+    # Bill to Place of Supply INVOICE No Dated
+    # [Company info lines]
+    # GST Tin No:-06AAFCI1834E1ZX 1 12-Nov-25
     
-    # Try to find the line containing both INVOICE No and Dated
-    pattern = r'INVOICE\s+No\s+Dated\s*\n?\s*(\d+)\s+(\d{1,2}-[A-Za-z]{3}-\d{2,4})'
-    match = re.search(pattern, text, re.IGNORECASE | re.MULTILINE)
-    
+    # Pattern 1: Find "INVOICE No Dated" header, then look for number and date pattern after GST
+    pattern1 = r'GST\s+Tin\s+No[:\-]*[A-Z0-9]+\s+(\d+)\s+(\d{1,2}-[A-Za-z]{3}-\d{2,4})'
+    match = re.search(pattern1, text, re.IGNORECASE)
     if match:
         return match.group(1).strip(), match.group(2).strip()
     
-    # Alternative: Try to find them separately on consecutive lines
+    # Pattern 2: Find standalone number and date at the end of a line after GST
+    pattern2 = r'[A-Z0-9]{15}\s+(\d+)\s+(\d{1,2}-[A-Za-z]{3}-\d{2,4})'
+    match = re.search(pattern2, text)
+    if match:
+        return match.group(1).strip(), match.group(2).strip()
+    
+    # Pattern 3: Look for the header line, then search for invoice number and date in the next few lines
     lines = text.split('\n')
+    found_header = False
     for i, line in enumerate(lines):
         if 'INVOICE No' in line and 'Dated' in line:
-            # Check next line for values
-            if i + 1 < len(lines):
-                next_line = lines[i + 1].strip()
-                # Try to extract invoice number and date from next line
-                parts = next_line.split()
-                if len(parts) >= 2:
-                    invoice_no = parts[0]
-                    invoice_date = parts[1] if len(parts) > 1 else ""
-                    return invoice_no, invoice_date
+            found_header = True
+            # Look in the next 10 lines for a number followed by a date
+            for j in range(i+1, min(i+11, len(lines))):
+                search_line = lines[j]
+                # Find pattern: number followed by date format
+                date_pattern = r'(\d+)\s+(\d{1,2}-[A-Za-z]{3}-\d{2,4})'
+                match = re.search(date_pattern, search_line)
+                if match:
+                    return match.group(1).strip(), match.group(2).strip()
     
     # Fallback: extract separately
     invoice_no = ""
     invoice_date = ""
     
-    # Extract Invoice Number
+    # Extract just the invoice number (single digit or multi-digit)
     inv_patterns = [
-        r'INVOICE\s+No\s*[:\-]?\s*(\d+)',
-        r'Invoice\s+Number\s*[:\-]?\s*(\d+)',
+        r'(?:INVOICE|Invoice)\s+(?:No|Number)\s+Dated\s+(\d+)',
+        r'GST[^0-9]*[A-Z0-9]{15}\s+(\d+)\s+\d{1,2}-',
     ]
     for pattern in inv_patterns:
         match = re.search(pattern, text, re.IGNORECASE)
@@ -101,9 +109,8 @@ def extract_invoice_number_and_date(text):
     
     # Extract Date (looking for format like "12-Nov-25" or "12-Nov-2025")
     date_patterns = [
-        r'Dated\s*[:\-]?\s*(\d{1,2}-[A-Za-z]{3}-\d{2,4})',
-        r'Date\s*[:\-]?\s*(\d{1,2}-[A-Za-z]{3}-\d{2,4})',
         r'(\d{1,2}-[A-Za-z]{3}-\d{2,4})',  # Generic date pattern
+        r'Dated\s+\d+\s+(\d{1,2}-[A-Za-z]{3}-\d{2,4})',
     ]
     for pattern in date_patterns:
         match = re.search(pattern, text, re.IGNORECASE)
