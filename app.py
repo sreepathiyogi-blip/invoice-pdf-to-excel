@@ -29,6 +29,14 @@ def derive_bank_name(ifsc):
         return "Kotak Mahindra Bank"
     elif ifsc_upper.startswith("BKID"):
         return "Bank of India"
+    elif ifsc_upper.startswith("PUNB"):
+        return "Punjab National Bank"
+    elif ifsc_upper.startswith("UBIN"):
+        return "Union Bank of India"
+    elif ifsc_upper.startswith("BARB"):
+        return "Bank of Baroda"
+    elif ifsc_upper.startswith("CNRB"):
+        return "Canara Bank"
     else:
         # Return first 4 characters as bank identifier
         return ifsc[:4].upper() if len(ifsc) >= 4 else ifsc.upper()
@@ -39,117 +47,217 @@ def clean_field_value(value):
         return ""
     
     # Remove common prefixes with various separators
-    value = re.sub(r'^(Name|Code|Number|Account\s+Number|IFSC|PAN|GST)[-:\s]+', '', value, flags=re.IGNORECASE)
+    value = re.sub(r'^(Name|Code|Number|Account\s+Number|A/?c\s+No\.?|IFSC|PAN|GST|Tin\s+No)[-:\s]+', '', value, flags=re.IGNORECASE)
     
     return value.strip()
 
 def extract_party_name(text):
-    """Extract Account Holder name from bank details section"""
-    # Look for "Account Holder:" pattern with various formats
-    patterns = [
-        # Pattern: Account Holder : Name : JOHN DOE
-        r'Account\s+Holder\s*:\s*Name\s*:\s*([A-Z][A-Z\s]+?)(?:\n|Account\s+Number)',
-        # Pattern: Account Holder : JOHN DOE
-        r'Account\s+Holder\s*:\s*([A-Z][A-Z\s]+?)(?:\n|Account\s+Number)',
-        # Pattern: Name : JOHN DOE (standalone)
-        r'(?:^|\n)Name\s*:\s*([A-Z][A-Z\s]+?)(?:\n)',
-        # Pattern: Account Holder (multiline)
-        r'Account\s+Holder\s*:\s*\n\s*([A-Z][A-Z\s]+?)(?:\n)',
+    """Extract Party Name - tries multiple methods"""
+    
+    # Method 1: Look for business name right after "INVOICE" header
+    invoice_name_pattern = r'INVOICE\s*\n\s*([A-Z][A-Za-z\s]+)\s*\n'
+    match = re.search(invoice_name_pattern, text)
+    if match:
+        name = match.group(1).strip()
+        if len(name) > 2 and len(name) < 100:
+            return name
+    
+    # Method 2: Look for "Account Holder" with various formats
+    acc_holder_patterns = [
+        r'Account\s+Holder\s*:\s*(?:Name\s*:\s*)?([A-Z][A-Za-z\s]+?)(?:\n|Account\s+Number)',
+        r'Account\s+Holder\s*:\s*([^\n]+)',
+        r'Name\s*:\s*([A-Z][A-Z\s]+?)(?:\n)',
     ]
     
-    for pattern in patterns:
+    for pattern in acc_holder_patterns:
         match = re.search(pattern, text, re.IGNORECASE | re.MULTILINE)
         if match:
             name = match.group(1).strip()
-            # Clean the name
             name = clean_field_value(name)
-            # Validate it looks like a name (at least 2 words, all caps)
-            if name and len(name) > 2 and re.match(r'^[A-Z\s]+$', name):
+            if name and len(name) > 2 and len(name) < 100:
                 return name
     
-    return ""
-
-def extract_value_after_keyword(text, keyword):
-    """Extract value after a keyword with flexible matching"""
-    patterns = [
-        rf"{re.escape(keyword)}\s*[:\-]?\s*([^\n]+)",
-        rf"{re.escape(keyword)}\s*[:\-]?\s*[\r\n]+\s*([^\n]+)",
-        rf"{keyword}\s+([^\n]+)",
-    ]
-    
-    for pattern in patterns:
-        match = re.search(pattern, text, re.IGNORECASE | re.MULTILINE)
-        if match:
-            value = match.group(1).strip()
-            # Clean the value
-            value = clean_field_value(value)
-            if value and value != "":
-                return value
+    # Method 3: Look for name in header section (first 500 chars)
+    header = text[:500]
+    lines = header.split('\n')
+    for line in lines[1:6]:  # Check lines 2-6
+        line = line.strip()
+        # If line looks like a name (mostly letters, spaces, reasonable length)
+        if line and re.match(r'^[A-Z][A-Za-z\s\.]+$', line) and 3 < len(line) < 50:
+            if not any(keyword in line.upper() for keyword in ['INVOICE', 'PHONE', 'EMAIL', 'ADDRESS', 'GST']):
+                return line
     
     return ""
 
 def extract_invoice_number_and_date(text):
-    """Extract Invoice Number and Date from the header table"""
+    """Extract Invoice Number and Date - handles multiple formats"""
     invoice_no = ""
     invoice_date = ""
     
-    # Try multiple patterns
-    # Pattern 1: GST line followed by number and date
-    pattern1 = r'GST\s+Tin\s+No[:\-]*[A-Z0-9]+\s+(\d+)\s+(\d{1,2}-[A-Za-z]{3}-\d{2,4})'
-    match = re.search(pattern1, text, re.IGNORECASE)
-    if match:
-        return match.group(1).strip(), match.group(2).strip()
+    # Try to find invoice number and date together
+    combined_patterns = [
+        # Pattern: INVOICE No <space> Dated in header, then number and date in table
+        r'INVOICE\s+No.*?Dated.*?\n.*?(\d+)\s+([\d\.-]+)',
+        # Pattern: GST line followed by number and date
+        r'GST\s+Tin\s+No[:\-]*[A-Z0-9]+\s+(\d+)\s+([\d\.-]+)',
+        # Pattern: standalone in table format
+        r'(\d+)\s+([\d]{1,2}[\./-][A-Za-z]{3}[\./-][\d]{2,4})',
+        r'(\d+)\s+([\d]{1,2}[\./-][\d]{1,2}[\./-][\d]{2,4})',
+    ]
     
-    # Pattern 2: Look for "INVOICE No" and "Dated" in same line, then find values
-    lines = text.split('\n')
-    for i, line in enumerate(lines):
-        if 'INVOICE' in line.upper() and 'DATED' in line.upper():
-            # Check next 10 lines for invoice number and date
-            for j in range(i+1, min(i+11, len(lines))):
-                check_line = lines[j]
-                # Match pattern: <number> <date>
-                date_match = re.search(r'(\d+)\s+(\d{1,2}-[A-Za-z]{3}-\d{2,4})', check_line)
-                if date_match:
-                    return date_match.group(1).strip(), date_match.group(2).strip()
+    for pattern in combined_patterns:
+        match = re.search(pattern, text, re.IGNORECASE | re.MULTILINE)
+        if match:
+            invoice_no = match.group(1).strip()
+            invoice_date = match.group(2).strip()
+            # Normalize date format (convert dots to dashes)
+            invoice_date = invoice_date.replace('.', '-').replace('/', '-')
+            return invoice_no, invoice_date
     
-    # Pattern 3: Extract separately
-    # Find invoice number
+    # Extract separately if combined search fails
+    
+    # Invoice Number patterns
     inv_patterns = [
         r'Invoice\s+(?:No|Number)\s*[:\-]?\s*(\d+)',
-        r'INVOICE\s+No\s+Dated\s*\n.*?(\d+)\s+\d{1,2}-',
+        r'INVOICE\s+No\s+Dated\s*\n.*?(\d+)',
+        r'Invoice\s*#?\s*(\d+)',
+        r'Bill\s+No\s*[:\-]?\s*(\d+)',
     ]
+    
     for pattern in inv_patterns:
         match = re.search(pattern, text, re.IGNORECASE | re.MULTILINE)
         if match:
             invoice_no = match.group(1).strip()
             break
     
-    # Find date
+    # Date patterns - handle multiple formats
     date_patterns = [
-        r'Dated\s*[:\-]?\s*(\d{1,2}-[A-Za-z]{3}-\d{2,4})',
-        r'Date\s*[:\-]?\s*(\d{1,2}-[A-Za-z]{3}-\d{2,4})',
-        r'(\d{1,2}-[A-Za-z]{3}-\d{2,4})',  # Generic date
+        r'Dated?\s*[:\-]?\s*([\d]{1,2}[\./-][A-Za-z]{3}[\./-][\d]{2,4})',
+        r'Dated?\s*[:\-]?\s*([\d]{1,2}[\./-][\d]{1,2}[\./-][\d]{2,4})',
+        r'Date\s*[:\-]?\s*([\d]{1,2}[\./-][A-Za-z]{3}[\./-][\d]{2,4})',
+        r'Date\s*[:\-]?\s*([\d]{1,2}[\./-][\d]{1,2}[\./-][\d]{2,4})',
+        r'([\d]{1,2}[\./-][A-Za-z]{3}[\./-][\d]{2,4})',
+        r'([\d]{1,2}[\./-][\d]{1,2}[\./-][\d]{2,4})',
     ]
+    
     for pattern in date_patterns:
         match = re.search(pattern, text, re.IGNORECASE)
         if match:
             invoice_date = match.group(1).strip()
+            # Normalize date format
+            invoice_date = invoice_date.replace('.', '-').replace('/', '-')
             break
     
     return invoice_no, invoice_date
 
-def clean_amount(amount_str):
-    """Clean and extract numeric amount"""
-    if not amount_str:
-        return ""
+def extract_amount(text):
+    """Extract total amount - handles multiple formats"""
     
-    # Remove common currency symbols and text
-    amount_str = re.sub(r'Rs\.?|INR|₹|USD|\$', '', amount_str, flags=re.IGNORECASE)
+    # Patterns for amount
+    amount_patterns = [
+        # Total with currency symbol
+        r'Total\s*[:\-]?\s*(?:Rs\.?|INR|₹)?\s*([\d,]+\.?\d*)',
+        r'Grand\s+Total\s*[:\-]?\s*(?:Rs\.?|INR|₹)?\s*([\d,]+\.?\d*)',
+        r'Net\s+(?:Amount|Total)\s*[:\-]?\s*(?:Rs\.?|INR|₹)?\s*([\d,]+\.?\d*)',
+        r'Amount\s+Payable\s*[:\-]?\s*(?:Rs\.?|INR|₹)?\s*([\d,]+\.?\d*)',
+        # In table with Amount column
+        r'Amount\s*\n.*?([\d,]+\.?\d*)\s*$',
+    ]
     
-    # Extract number (including decimals and commas)
-    match = re.search(r'[\d,]+\.?\d*', amount_str)
-    if match:
-        return match.group(0).replace(',', '')
+    for pattern in amount_patterns:
+        match = re.search(pattern, text, re.IGNORECASE | re.MULTILINE)
+        if match:
+            amount = match.group(1).replace(',', '').strip()
+            # Validate it's a reasonable number
+            try:
+                float(amount)
+                return amount
+            except:
+                continue
+    
+    return ""
+
+def extract_account_number(text):
+    """Extract bank account number"""
+    
+    acc_patterns = [
+        r'Account\s+Number\s*[:\-]?\s*(\d+)',
+        r'A/?c\s+No\.?\s*[:\-]?\s*(\d+)',
+        r'Bank\s+Account\s+No\.?\s*[:\-]?\s*(\d+)',
+        r'Account\s+No\.?\s*[:\-]?\s*(\d+)',
+        r'Acc\.?\s+No\.?\s*[:\-]?\s*(\d+)',
+    ]
+    
+    for pattern in acc_patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            account_no = match.group(1).strip()
+            account_no = clean_field_value(account_no)
+            return account_no
+    
+    return ""
+
+def extract_ifsc(text):
+    """Extract IFSC code - handles multiple formats"""
+    
+    ifsc_patterns = [
+        # Standard IFSC format with label
+        r'IFSC\s*(?:Code)?\s*[:\-]?\s*([A-Z]{4}[0-9]{7})',
+        # Code- prefix (like "Code- BKID0004500")
+        r'Code[-:\s]+([A-Z]{4}[0-9]{7})',
+        # Just the IFSC code itself (11 chars: 4 letters + 7 digits)
+        r'\b([A-Z]{4}[0-9]{7})\b',
+    ]
+    
+    for pattern in ifsc_patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            ifsc = match.group(1).upper().strip()
+            # Validate IFSC format
+            if len(ifsc) == 11 and re.match(r'^[A-Z]{4}[0-9]{7}$', ifsc):
+                return ifsc
+    
+    return ""
+
+def extract_pan(text):
+    """Extract PAN number"""
+    
+    pan_patterns = [
+        # Standard PAN format with label
+        r'PAN\s*(?:No\.?)?\s*[:\-]?\s*([A-Z]{5}[0-9]{4}[A-Z])',
+        # Just the PAN itself (10 chars: 5 letters + 4 digits + 1 letter)
+        r'\b([A-Z]{5}[0-9]{4}[A-Z])\b',
+    ]
+    
+    for pattern in pan_patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            pan = match.group(1).upper().strip()
+            # Validate PAN format
+            if len(pan) == 10 and re.match(r'^[A-Z]{5}[0-9]{4}[A-Z]$', pan):
+                return pan
+    
+    return ""
+
+def extract_gst(text):
+    """Extract GST number"""
+    
+    gst_patterns = [
+        # Standard GST format with label
+        r'GST\s+Tin\s+No[:\-\s]*([0-9]{2}[A-Z]{5}[0-9]{4}[A-Z]{1}[1-9A-Z]{1}[Z]{1}[0-9A-Z]{1})',
+        r'GSTIN\s*[:\-]?\s*([0-9]{2}[A-Z]{5}[0-9]{4}[A-Z]{1}[1-9A-Z]{1}[Z]{1}[0-9A-Z]{1})',
+        r'GST\s*(?:No\.?)?\s*[:\-]?\s*([0-9]{2}[A-Z]{5}[0-9]{4}[A-Z]{1}[1-9A-Z]{1}[Z]{1}[0-9A-Z]{1})',
+        # Just the GST itself (15 chars)
+        r'\b([0-9]{2}[A-Z]{5}[0-9]{4}[A-Z]{1}[1-9A-Z]{1}[Z]{1}[0-9A-Z]{1})\b',
+    ]
+    
+    for pattern in gst_patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            gst = match.group(1).upper().strip()
+            # Validate GST format
+            if len(gst) == 15:
+                return gst
     
     return ""
 
@@ -168,113 +276,20 @@ def extract_invoice_data(pdf_file):
                 st.warning(f"⚠️ No text found in {pdf_file.name}. It might be a scanned PDF.")
                 return None
             
-            # Extract Party Name (Account Holder)
+            # Extract all fields using flexible patterns
             party_name = extract_party_name(full_text)
-            
-            # Extract Invoice Number and Date
             invoice_no, invoice_date = extract_invoice_number_and_date(full_text)
+            amount = extract_amount(full_text)
+            account_no = extract_account_number(full_text)
+            ifsc = extract_ifsc(full_text)
+            pan = extract_pan(full_text)
+            gst = extract_gst(full_text)
             
-            # Extract Total Amount
-            # Multiple patterns for "Total"
-            total_patterns = [
-                r'Total\s*[:\-]?\s*Rs\.?\s*(\d+[,\d]*\.?\d*)',
-                r'Total\s+[\(\s]*(\d+[,\d]*\.?\d*)[\)\s]*',
-                r'Grand\s+Total\s*[:\-]?\s*(\d+[,\d]*\.?\d*)',
-            ]
-            
-            amount = ""
-            for pattern in total_patterns:
-                total_match = re.search(pattern, full_text, re.IGNORECASE)
-                if total_match:
-                    amount = total_match.group(1).replace(',', '')
-                    break
-            
-            if not amount:
-                amount_raw = extract_value_after_keyword(full_text, "Total")
-                amount = clean_amount(amount_raw)
-            
-            # Extract Account Number
-            account_no = ""
-            acc_patterns = [
-                r'Account\s+Number\s*[:\-]\s*(\d+)',
-                r'A/c\s+No\.?\s*[:\-]?\s*(\d+)',
-                r'Account\s+No\.?\s*[:\-]?\s*(\d+)',
-            ]
-            
-            for pattern in acc_patterns:
-                acc_match = re.search(pattern, full_text, re.IGNORECASE)
-                if acc_match:
-                    account_no = acc_match.group(1).strip()
-                    break
-            
-            if not account_no:
-                account_no = extract_value_after_keyword(full_text, "Account Number")
-            
-            # Clean account number
+            # Clean all extracted values
+            party_name = clean_field_value(party_name)
             account_no = clean_field_value(account_no)
-            
-            # Extract IFSC Code - handle "Code- BKID0004500" format
-            ifsc = ""
-            ifsc_patterns = [
-                r'IFSC\s*[:\-]\s*([A-Z]{4}[0-9]{7})',  # Standard IFSC format
-                r'Code[-:\s]+([A-Z]{4}[0-9]{7})',  # Code- prefix
-                r'IFSC\s+Code\s*[:\-]?\s*([A-Z]{4}[0-9]{7})',
-                r'([A-Z]{4}[0-9]{7})',  # Just the code itself
-            ]
-            
-            for pattern in ifsc_patterns:
-                ifsc_match = re.search(pattern, full_text, re.IGNORECASE)
-                if ifsc_match:
-                    ifsc = ifsc_match.group(1).upper().strip()
-                    # Validate IFSC format
-                    if len(ifsc) == 11 and re.match(r'^[A-Z]{4}[0-9]{7}$', ifsc):
-                        break
-            
-            if not ifsc:
-                ifsc = extract_value_after_keyword(full_text, "IFSC")
-            
-            # Clean IFSC
             ifsc = clean_field_value(ifsc)
-            
-            # Extract PAN
-            pan = ""
-            pan_patterns = [
-                r'PAN\s*[:\-]\s*([A-Z]{5}[0-9]{4}[A-Z])',  # Standard PAN format
-                r'PAN\s+No\.?\s*[:\-]?\s*([A-Z]{5}[0-9]{4}[A-Z])',
-            ]
-            
-            for pattern in pan_patterns:
-                pan_match = re.search(pattern, full_text, re.IGNORECASE)
-                if pan_match:
-                    pan = pan_match.group(1).upper().strip()
-                    break
-            
-            if not pan:
-                pan = extract_value_after_keyword(full_text, "PAN")
-            
-            # Clean PAN
             pan = clean_field_value(pan)
-            
-            # Extract GST
-            gst = ""
-            gst_patterns = [
-                r'GST\s+Tin\s+No[:\-\s]*([0-9]{2}[A-Z]{5}[0-9]{4}[A-Z]{1}[1-9A-Z]{1}Z[0-9A-Z]{1})',
-                r'GSTIN\s*[:\-]\s*([0-9]{2}[A-Z]{5}[0-9]{4}[A-Z]{1}[1-9A-Z]{1}Z[0-9A-Z]{1})',
-                r'GST\s*[:\-]\s*([0-9]{2}[A-Z]{5}[0-9]{4}[A-Z]{1}[1-9A-Z]{1}Z[0-9A-Z]{1})',
-            ]
-            
-            for pattern in gst_patterns:
-                gst_match = re.search(pattern, full_text, re.IGNORECASE)
-                if gst_match:
-                    gst = gst_match.group(1).upper().strip()
-                    break
-            
-            if not gst:
-                gst = extract_value_after_keyword(full_text, "GST Tin No")
-            if not gst:
-                gst = extract_value_after_keyword(full_text, "GSTIN")
-            
-            # Clean GST
             gst = clean_field_value(gst)
             
             # Use PAN if available, otherwise GST
@@ -312,7 +327,7 @@ def main():
         "Upload Invoice PDFs",
         type=['pdf'],
         accept_multiple_files=True,
-        help="Select one or more PDF invoices with the same format"
+        help="Select one or more PDF invoices"
     )
     
     if uploaded_files:
@@ -415,24 +430,36 @@ def main():
     # Footer
     st.markdown("---")
     st.markdown("**Business Rules:**")
-    st.markdown("• Party name is extracted from 'Account Holder' field")
+    st.markdown("• Party name is extracted from invoice header or account holder field")
     st.markdown("• PAN is extracted if available, otherwise GST")
-    st.markdown("• Bank name is derived from IFSC code")
+    st.markdown("• Bank name is automatically derived from IFSC code")
+    st.markdown("• Supports multiple invoice formats and layouts")
     
     # Sidebar info
     with st.sidebar:
-        st.markdown("### 📝 Expected PDF Fields")
+        st.markdown("### 📝 Supported Fields")
         st.markdown("""
-        **From your invoice format:**
-        - INVOICE No (top right)
-        - Dated (top right)
-        - Total (bottom)
-        - Account Holder (bank details)
-        - Account Number (bank details)
-        - IFSC (bank details)
-        - PAN (bank details)
-        - GST Tin No (supplier info)
+        **The app will automatically detect:**
+        - Party Name / Account Holder
+        - Invoice Number
+        - Invoice Date (multiple formats)
+        - Total Amount
+        - Bank Account Number
+        - IFSC Code
+        - PAN Number
+        - GST Number
+        
+        **Supported date formats:**
+        - DD-MMM-YYYY (e.g., 12-Nov-25)
+        - DD.MM.YYYY (e.g., 22.11.2025)
+        - DD/MM/YYYY (e.g., 22/11/2025)
         """)
+        
+        st.markdown("---")
+        st.markdown("**💡 Tips:**")
+        st.markdown("• Enable Debug Mode to see extracted text")
+        st.markdown("• Works with multiple invoice formats")
+        st.markdown("• Upload multiple PDFs at once")
 
 if __name__ == "__main__":
     main()
