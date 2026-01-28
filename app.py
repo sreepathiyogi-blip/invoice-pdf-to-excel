@@ -13,6 +13,9 @@ def derive_bank_name(ifsc):
     if not ifsc:
         return ""
     
+    # Clean the IFSC code first - remove any "Code :" prefix
+    ifsc = re.sub(r'^(Code|IFSC)\s*:\s*', '', ifsc, flags=re.IGNORECASE).strip()
+    
     ifsc_upper = ifsc.upper().strip()
     if ifsc_upper.startswith("HDFC"):
         return "HDFC Bank"
@@ -20,22 +23,39 @@ def derive_bank_name(ifsc):
         return "ICICI Bank"
     elif ifsc_upper.startswith("SBIN"):
         return "SBI"
+    elif ifsc_upper.startswith("AXIS"):
+        return "Axis Bank"
+    elif ifsc_upper.startswith("KKBK"):
+        return "Kotak Mahindra Bank"
     else:
         # Return first 4 characters as bank identifier
         return ifsc[:4].upper() if len(ifsc) >= 4 else ifsc.upper()
+
+def clean_field_value(value):
+    """Remove common prefixes like 'Name :', 'Code :', etc."""
+    if not value:
+        return ""
+    
+    # Remove common prefixes
+    value = re.sub(r'^(Name|Code|Number|Account\s+Number|IFSC|PAN|GST)\s*:\s*', '', value, flags=re.IGNORECASE)
+    
+    return value.strip()
 
 def extract_party_name(text):
     """Extract Account Holder name from bank details section"""
     # Look for "Account Holder:" pattern
     patterns = [
-        r'Account\s+Holder\s*:\s*([A-Z\s]+?)(?:\n|Account)',
-        r'Account\s+Holder\s*:\s*([^\n]+)',
+        r'Account\s+Holder\s*:\s*(?:Name\s*:\s*)?([A-Z\s]+?)(?:\n|Account)',
+        r'Account\s+Holder\s*:\s*(?:Name\s*:\s*)?([^\n]+)',
+        r'Name\s*:\s*([A-Z][A-Z\s]+?)(?:\n)',
     ]
     
     for pattern in patterns:
         match = re.search(pattern, text, re.IGNORECASE)
         if match:
             name = match.group(1).strip()
+            # Clean the name
+            name = clean_field_value(name)
             if name and len(name) > 2:
                 return name
     
@@ -53,6 +73,8 @@ def extract_value_after_keyword(text, keyword):
         match = re.search(pattern, text, re.IGNORECASE | re.MULTILINE)
         if match:
             value = match.group(1).strip()
+            # Clean the value
+            value = clean_field_value(value)
             if value and value != "":
                 return value
     
@@ -156,7 +178,7 @@ def extract_invoice_data(pdf_file):
                 # Fallback: try to get from "Account Holder" line
                 party_name = extract_value_after_keyword(full_text, "Account Holder")
             
-            # Extract Invoice Number and Date (FIXED)
+            # Extract Invoice Number and Date
             invoice_no, invoice_date = extract_invoice_number_and_date(full_text)
             
             # Extract Total Amount
@@ -178,14 +200,20 @@ def extract_invoice_data(pdf_file):
                 if acc_match:
                     account_no = acc_match.group(1)
             
+            # Clean account number
+            account_no = clean_field_value(account_no)
+            
             # Extract IFSC Code
             ifsc = extract_value_after_keyword(full_text, "IFSC")
             if not ifsc:
-                # Try pattern: "IFSC: HDFC0001993"
-                ifsc_pattern = r'IFSC\s*:\s*([A-Z0-9]+)'
+                # Try pattern: "IFSC: HDFC0001993" or "Code : HDFC0000148"
+                ifsc_pattern = r'(?:IFSC|Code)\s*:\s*([A-Z0-9]+)'
                 ifsc_match = re.search(ifsc_pattern, full_text, re.IGNORECASE)
                 if ifsc_match:
                     ifsc = ifsc_match.group(1)
+            
+            # Clean IFSC
+            ifsc = clean_field_value(ifsc)
             
             # Extract PAN
             pan = extract_value_after_keyword(full_text, "PAN :")
@@ -198,6 +226,9 @@ def extract_invoice_data(pdf_file):
                 if pan_match:
                     pan = pan_match.group(1)
             
+            # Clean PAN
+            pan = clean_field_value(pan)
+            
             # Extract GST
             gst = extract_value_after_keyword(full_text, "GST Tin No")
             if not gst:
@@ -209,10 +240,13 @@ def extract_invoice_data(pdf_file):
                 if gst_match:
                     gst = gst_match.group(1)
             
+            # Clean GST
+            gst = clean_field_value(gst)
+            
             # Use PAN if available, otherwise GST
             pan_gst = pan if pan else gst
             
-            # Derive bank name from IFSC
+            # Derive bank name from IFSC (after cleaning)
             bank_name = derive_bank_name(ifsc)
             
             return {
