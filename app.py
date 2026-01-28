@@ -41,6 +41,50 @@ def derive_bank_name(ifsc):
         # Return first 4 characters as bank identifier
         return ifsc[:4].upper() if len(ifsc) >= 4 else ifsc.upper()
 
+def normalize_date(date_str):
+    """Convert any date format to DD-MM-YYYY"""
+    if not date_str:
+        return ""
+    
+    # Month abbreviations mapping
+    month_map = {
+        'jan': '01', 'feb': '02', 'mar': '03', 'apr': '04',
+        'may': '05', 'jun': '06', 'jul': '07', 'aug': '08',
+        'sep': '09', 'oct': '10', 'nov': '11', 'dec': '12'
+    }
+    
+    # Pattern 1: 22-Dec-25 or 22-Dec-2025 (with month name)
+    match = re.match(r'(\d{1,2})[-\./]([A-Za-z]{3})[-\./](\d{2,4})', date_str)
+    if match:
+        day = match.group(1).zfill(2)
+        month_name = match.group(2).lower()
+        year = match.group(3)
+        
+        # Convert 2-digit year to 4-digit
+        if len(year) == 2:
+            year = '20' + year
+        
+        # Convert month name to number
+        month = month_map.get(month_name, '01')
+        
+        return f"{day}-{month}-{year}"
+    
+    # Pattern 2: 22-11-25 or 22-11-2025 (numeric)
+    match = re.match(r'(\d{1,2})[-\./](\d{1,2})[-\./](\d{2,4})', date_str)
+    if match:
+        day = match.group(1).zfill(2)
+        month = match.group(2).zfill(2)
+        year = match.group(3)
+        
+        # Convert 2-digit year to 4-digit
+        if len(year) == 2:
+            year = '20' + year
+        
+        return f"{day}-{month}-{year}"
+    
+    # If no pattern matches, return as-is
+    return date_str
+
 def clean_field_value(value):
     """Remove common prefixes like 'Name :', 'Code-', etc."""
     if not value:
@@ -115,8 +159,8 @@ def extract_invoice_number_and_date(text):
         if match:
             invoice_no = match.group(1).strip()
             invoice_date = match.group(2).strip()
-            # Normalize date format (convert dots and slashes to dashes)
-            invoice_date = invoice_date.replace('.', '-').replace('/', '-')
+            # Normalize to DD-MM-YYYY format
+            invoice_date = normalize_date(invoice_date)
             return invoice_no, invoice_date
     
     # Extract separately if combined search fails
@@ -154,20 +198,23 @@ def extract_invoice_number_and_date(text):
         match = re.search(pattern, text, re.IGNORECASE)
         if match:
             invoice_date = match.group(1).strip()
-            # Normalize date format (dots and slashes to dashes)
-            invoice_date = invoice_date.replace('.', '-').replace('/', '-')
+            # Normalize to DD-MM-YYYY format
+            invoice_date = normalize_date(invoice_date)
             break
     
     return invoice_no, invoice_date
 
 def extract_amount_from_tables(tables):
-    """Extract amount from table structure"""
+    """Extract amount from table structure - prioritizes proper currency format"""
+    
+    candidates = []  # Store potential amounts with their scores
+    
     for table in tables:
         if not table:
             continue
         
         # Look for Amount column
-        for row in table:
+        for row_idx, row in enumerate(table):
             if not row:
                 continue
             
@@ -182,22 +229,35 @@ def extract_amount_from_tables(tables):
                         break
                 
                 if amount_col_idx is not None:
-                    # Look for the last non-empty value in Amount column
-                    table_idx = tables.index(table)
-                    for check_row in reversed(table[table.index(row)+1:]):
+                    # Look for values in Amount column from this point onwards
+                    for check_row in table[row_idx+1:]:
                         if amount_col_idx < len(check_row) and check_row[amount_col_idx]:
                             amount_val = str(check_row[amount_col_idx]).strip()
-                            # Clean and validate
+                            # Clean - remove any non-numeric except comma and decimal
                             amount_val = re.sub(r'[^\d,\.]', '', amount_val)
                             if amount_val:
                                 try:
                                     amt = float(amount_val.replace(',', ''))
-                                    if amt > 0 and amt < 100000000:
-                                        return amount_val.replace(',', '')
+                                    # Score: higher for amounts with decimal points (standard currency format)
+                                    score = 10 if '.' in amount_val else 5
+                                    # Higher score for amounts > 100
+                                    if amt >= 100:
+                                        score += 5
+                                    # Higher score for proper decimal format (.00, .50, etc)
+                                    if re.match(r'^\d{1,3}(,\d{3})*\.\d{2}$', amount_val):
+                                        score += 10
+                                    
+                                    if amt >= 10 and amt < 100000000:
+                                        candidates.append((score, amount_val.replace(',', ''), amt))
                                 except:
                                     continue
     
-    # Fallback: Look for any cell with number format like "3,000.00"
+    # If we found candidates, return the one with highest score
+    if candidates:
+        candidates.sort(reverse=True, key=lambda x: (x[0], x[2]))  # Sort by score, then amount
+        return candidates[0][1]
+    
+    # Fallback: Look for any cell with proper currency format (X,XXX.XX)
     for table in tables:
         if not table:
             continue
@@ -207,11 +267,11 @@ def extract_amount_from_tables(tables):
             for cell in row:
                 if cell:
                     cell_str = str(cell).strip()
-                    # Check if it matches amount pattern
-                    if re.match(r'^[\d,]+\.?\d*$', cell_str):
+                    # Check if it matches proper currency pattern with decimal
+                    if re.match(r'^\d{1,3}(,\d{3})*\.\d{2}$', cell_str):
                         try:
                             amt = float(cell_str.replace(',', ''))
-                            if amt > 100 and amt < 100000000:  # Reasonable amount range
+                            if amt >= 100 and amt < 100000000:  # Reasonable amount range
                                 return cell_str.replace(',', '')
                         except:
                             continue
@@ -223,33 +283,27 @@ def extract_amount(text):
     
     # Patterns for amount - ordered from most specific to most general
     amount_patterns = [
-        # Pattern 1: Amount column in table with value (handles "Amount\n3,000.00")
-        r'Amount\s*\n\s*([\d,]+\.?\d*)',
+        # Pattern 1: Amount column in table with value (handles "Amount\n3,000.00" or "Amount\n3000.00")
+        r'Amount\s*\n\s*([\d,]+\.[\d]{2})',  # Must have decimal point
         
         # Pattern 2: RATE and Amount columns with value at end (handles table rows)
-        r'RATE\s+Amount\s*\n[\s\S]*?([\d,]+\.?\d*)\s*$',
+        r'RATE\s+Amount\s*\n[\s\S]*?([\d,]+\.[\d]{2})\s*$',
         
         # Pattern 3: Total/Grand Total with currency symbol
-        r'(?:Grand\s+)?Total\s*[:\-]?\s*(?:Rs\.?|INR|₹)\s*([\d,]+\.?\d*)',
-        r'(?:Net\s+)?(?:Amount|Total)\s*[:\-]?\s*(?:Rs\.?|INR|₹)\s*([\d,]+\.?\d*)',
-        r'Amount\s+Payable\s*[:\-]?\s*(?:Rs\.?|INR|₹)\s*([\d,]+\.?\d*)',
-        r'Balance\s+(?:Amount|Due)\s*[:\-]?\s*(?:Rs\.?|INR|₹)\s*([\d,]+\.?\d*)',
+        r'(?:Grand\s+)?Total\s*[:\-]?\s*(?:Rs\.?|INR|₹)\s*([\d,]+\.?[\d]*)',
+        r'(?:Net\s+)?(?:Amount|Total)\s*[:\-]?\s*(?:Rs\.?|INR|₹)\s*([\d,]+\.?[\d]*)',
+        r'Amount\s+Payable\s*[:\-]?\s*(?:Rs\.?|INR|₹)\s*([\d,]+\.?[\d]*)',
+        r'Balance\s+(?:Amount|Due)\s*[:\-]?\s*(?:Rs\.?|INR|₹)\s*([\d,]+\.?[\d]*)',
         
-        # Pattern 4: Total without currency symbol
-        r'(?:Grand\s+)?Total\s*[:\-]?\s*([\d,]+\.?\d*)\s*(?:Rs|INR|₹)?',
-        r'(?:Net\s+)?(?:Amount|Total)\s*[:\-]?\s*([\d,]+\.?\d*)\s*(?:Rs|INR|₹)?',
+        # Pattern 4: Total without currency symbol (must have decimal or comma formatting)
+        r'(?:Grand\s+)?Total\s*[:\-]?\s*([\d,]+\.[\d]{2})',
+        r'(?:Net\s+)?(?:Amount|Total)\s*[:\-]?\s*([\d,]+\.[\d]{2})',
         
-        # Pattern 5: Last number in Amount column (look for Amount header then find last big number)
-        r'Amount[^\d]*([\d,]+\.?\d*)(?!.*[\d,]{3,})',  # Find last occurrence after "Amount"
+        # Pattern 5: After QTY, RATE columns, look for amount with decimal
+        r'QTY\s+RATE\s+Amount[^\d]*([\d,]+\.[\d]{2})',
         
-        # Pattern 6: Total in parentheses or brackets
-        r'Total\s*[\(\[]?\s*([\d,]+\.?\d*)\s*[\)\]]?',
-        
-        # Pattern 7: After QTY, RATE columns, look for amount value
-        r'QTY\s+RATE\s+Amount[^\d]*([\d,]+\.?\d*)',
-        
-        # Pattern 8: Fallback - "Total" followed by numbers within next 50 chars
-        r'Total[^\d]{0,50}([\d,]+\.?\d*)',
+        # Pattern 6: Amount at the end of service description line
+        r'(?:Description|Service).*?Amount.*?\n.*?([\d,]+\.[\d]{2})',
     ]
     
     for pattern in amount_patterns:
@@ -260,28 +314,42 @@ def extract_amount(text):
             try:
                 amount_float = float(amount)
                 # Additional validation: amount should be positive and reasonable
-                if amount_float > 0 and amount_float < 100000000:  # Less than 10 crore
+                # Also should not be too small (avoid picking partial numbers)
+                if amount_float >= 10 and amount_float < 100000000:  # Between 10 and 10 crore
                     return amount
             except:
                 continue
     
-    # Fallback: Look for any large number that could be an amount (with comma formatting)
-    # This catches cases where amount is isolated
-    fallback_pattern = r'\b([\d]{1,3}(?:,[\d]{3})+\.?\d*)\b'
+    # Fallback: Look for comma-formatted numbers with 2 decimal places (standard currency format)
+    # This catches cases where amount is isolated like "3,000.00"
+    fallback_pattern = r'\b([\d]{1,3}(?:,[\d]{3})+\.[\d]{2})\b'
     matches = re.findall(fallback_pattern, text)
     if matches:
-        # Return the largest number found (likely to be the total)
+        # Return the largest reasonable amount
         amounts = []
         for match in matches:
             try:
                 amt = float(match.replace(',', ''))
-                if amt > 0 and amt < 100000000:
-                    amounts.append(match.replace(',', ''))
+                if amt >= 100 and amt < 100000000:  # Reasonable invoice amount
+                    amounts.append((amt, match.replace(',', '')))
             except:
                 continue
         if amounts:
-            # Return the last (usually total is at bottom)
-            return amounts[-1]
+            # Return the largest amount (likely to be the total)
+            amounts.sort(reverse=True)
+            return amounts[0][1]
+    
+    # Last resort: Look for any number with decimal point (not starting with leading zeros)
+    final_pattern = r'\b([1-9][\d,]*\.[\d]{2})\b'
+    matches = re.findall(final_pattern, text)
+    if matches:
+        for match in matches:
+            try:
+                amt = float(match.replace(',', ''))
+                if amt >= 100 and amt < 100000000:
+                    return match.replace(',', '')
+            except:
+                continue
     
     return ""
 
