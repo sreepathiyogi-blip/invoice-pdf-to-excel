@@ -97,12 +97,17 @@ def extract_invoice_number_and_date(text):
     # Try to find invoice number and date together
     combined_patterns = [
         # Pattern: INVOICE No <space> Dated in header, then number and date in table
-        r'INVOICE\s+No.*?Dated.*?\n.*?(\d+)\s+([\d\.-]+)',
+        r'INVOICE\s+No.*?Dated.*?\n.*?(\d+)\s+([\d]{1,2}[-\.\/][A-Za-z]{3}[-\.\/][\d]{2,4})',
+        r'INVOICE\s+No.*?Dated.*?\n.*?(\d+)\s+([\d]{1,2}[-\.\/][\d]{1,2}[-\.\/][\d]{2,4})',
         # Pattern: GST line followed by number and date
-        r'GST\s+Tin\s+No[:\-]*[A-Z0-9]+\s+(\d+)\s+([\d\.-]+)',
-        # Pattern: standalone in table format
-        r'(\d+)\s+([\d]{1,2}[\./-][A-Za-z]{3}[\./-][\d]{2,4})',
-        r'(\d+)\s+([\d]{1,2}[\./-][\d]{1,2}[\./-][\d]{2,4})',
+        r'GST\s+Tin\s+No[:\-]*[A-Z0-9]+\s+(\d+)\s+([\d]{1,2}[-\.\/][A-Za-z]{3}[-\.\/][\d]{2,4})',
+        r'GST\s+Tin\s+No[:\-]*[A-Z0-9]+\s+(\d+)\s+([\d]{1,2}[-\.\/][\d]{1,2}[-\.\/][\d]{2,4})',
+        # Pattern: standalone in table format with month names like 22-Dec-25
+        r'(\d+)\s+([\d]{1,2}-[A-Za-z]{3}-[\d]{2,4})',
+        r'(\d+)\s+([\d]{1,2}\.[A-Za-z]{3}\.[\d]{2,4})',
+        r'(\d+)\s+([\d]{1,2}/[A-Za-z]{3}/[\d]{2,4})',
+        # Pattern: numeric dates
+        r'(\d+)\s+([\d]{1,2}[-\./][\d]{1,2}[-\./][\d]{2,4})',
     ]
     
     for pattern in combined_patterns:
@@ -110,7 +115,7 @@ def extract_invoice_number_and_date(text):
         if match:
             invoice_no = match.group(1).strip()
             invoice_date = match.group(2).strip()
-            # Normalize date format (convert dots to dashes)
+            # Normalize date format (convert dots and slashes to dashes)
             invoice_date = invoice_date.replace('.', '-').replace('/', '-')
             return invoice_no, invoice_date
     
@@ -130,50 +135,153 @@ def extract_invoice_number_and_date(text):
             invoice_no = match.group(1).strip()
             break
     
-    # Date patterns - handle multiple formats
+    # Date patterns - handle multiple formats including 22-Dec-25
     date_patterns = [
-        r'Dated?\s*[:\-]?\s*([\d]{1,2}[\./-][A-Za-z]{3}[\./-][\d]{2,4})',
-        r'Dated?\s*[:\-]?\s*([\d]{1,2}[\./-][\d]{1,2}[\./-][\d]{2,4})',
-        r'Date\s*[:\-]?\s*([\d]{1,2}[\./-][A-Za-z]{3}[\./-][\d]{2,4})',
-        r'Date\s*[:\-]?\s*([\d]{1,2}[\./-][\d]{1,2}[\./-][\d]{2,4})',
-        r'([\d]{1,2}[\./-][A-Za-z]{3}[\./-][\d]{2,4})',
-        r'([\d]{1,2}[\./-][\d]{1,2}[\./-][\d]{2,4})',
+        # Month name formats (22-Dec-25, 22.Nov.25, 22/Jan/2025)
+        r'Dated?\s*[:\-]?\s*([\d]{1,2}[-\.\/][A-Za-z]{3}[-\.\/][\d]{2,4})',
+        r'Date\s*[:\-]?\s*([\d]{1,2}[-\.\/][A-Za-z]{3}[-\.\/][\d]{2,4})',
+        # Numeric formats (22-11-2025, 22.11.25, 22/11/25)
+        r'Dated?\s*[:\-]?\s*([\d]{1,2}[-\.\/][\d]{1,2}[-\.\/][\d]{2,4})',
+        r'Date\s*[:\-]?\s*([\d]{1,2}[-\.\/][\d]{1,2}[-\.\/][\d]{2,4})',
+        # Generic patterns (without keyword)
+        r'([\d]{1,2}-[A-Za-z]{3}-[\d]{2,4})',
+        r'([\d]{1,2}\.[A-Za-z]{3}\.[\d]{2,4})',
+        r'([\d]{1,2}/[A-Za-z]{3}/[\d]{2,4})',
+        r'([\d]{1,2}[-\.\/][\d]{1,2}[-\.\/][\d]{2,4})',
     ]
     
     for pattern in date_patterns:
         match = re.search(pattern, text, re.IGNORECASE)
         if match:
             invoice_date = match.group(1).strip()
-            # Normalize date format
+            # Normalize date format (dots and slashes to dashes)
             invoice_date = invoice_date.replace('.', '-').replace('/', '-')
             break
     
     return invoice_no, invoice_date
 
-def extract_amount(text):
-    """Extract total amount - handles multiple formats"""
+def extract_amount_from_tables(tables):
+    """Extract amount from table structure"""
+    for table in tables:
+        if not table:
+            continue
+        
+        # Look for Amount column
+        for row in table:
+            if not row:
+                continue
+            
+            # Check if this row has "Amount" header
+            row_str = ' '.join([str(cell) for cell in row if cell])
+            if 'Amount' in row_str.upper():
+                # Found header row, now look for amount values in subsequent rows
+                amount_col_idx = None
+                for idx, cell in enumerate(row):
+                    if cell and 'Amount' in str(cell).upper():
+                        amount_col_idx = idx
+                        break
+                
+                if amount_col_idx is not None:
+                    # Look for the last non-empty value in Amount column
+                    table_idx = tables.index(table)
+                    for check_row in reversed(table[table.index(row)+1:]):
+                        if amount_col_idx < len(check_row) and check_row[amount_col_idx]:
+                            amount_val = str(check_row[amount_col_idx]).strip()
+                            # Clean and validate
+                            amount_val = re.sub(r'[^\d,\.]', '', amount_val)
+                            if amount_val:
+                                try:
+                                    amt = float(amount_val.replace(',', ''))
+                                    if amt > 0 and amt < 100000000:
+                                        return amount_val.replace(',', '')
+                                except:
+                                    continue
     
-    # Patterns for amount
+    # Fallback: Look for any cell with number format like "3,000.00"
+    for table in tables:
+        if not table:
+            continue
+        for row in reversed(table):  # Start from bottom (totals usually at end)
+            if not row:
+                continue
+            for cell in row:
+                if cell:
+                    cell_str = str(cell).strip()
+                    # Check if it matches amount pattern
+                    if re.match(r'^[\d,]+\.?\d*$', cell_str):
+                        try:
+                            amt = float(cell_str.replace(',', ''))
+                            if amt > 100 and amt < 100000000:  # Reasonable amount range
+                                return cell_str.replace(',', '')
+                        except:
+                            continue
+    
+    return ""
+
+def extract_amount(text):
+    """Extract total amount - handles multiple formats including table layouts"""
+    
+    # Patterns for amount - ordered from most specific to most general
     amount_patterns = [
-        # Total with currency symbol
-        r'Total\s*[:\-]?\s*(?:Rs\.?|INR|₹)?\s*([\d,]+\.?\d*)',
-        r'Grand\s+Total\s*[:\-]?\s*(?:Rs\.?|INR|₹)?\s*([\d,]+\.?\d*)',
-        r'Net\s+(?:Amount|Total)\s*[:\-]?\s*(?:Rs\.?|INR|₹)?\s*([\d,]+\.?\d*)',
-        r'Amount\s+Payable\s*[:\-]?\s*(?:Rs\.?|INR|₹)?\s*([\d,]+\.?\d*)',
-        # In table with Amount column
-        r'Amount\s*\n.*?([\d,]+\.?\d*)\s*$',
+        # Pattern 1: Amount column in table with value (handles "Amount\n3,000.00")
+        r'Amount\s*\n\s*([\d,]+\.?\d*)',
+        
+        # Pattern 2: RATE and Amount columns with value at end (handles table rows)
+        r'RATE\s+Amount\s*\n[\s\S]*?([\d,]+\.?\d*)\s*$',
+        
+        # Pattern 3: Total/Grand Total with currency symbol
+        r'(?:Grand\s+)?Total\s*[:\-]?\s*(?:Rs\.?|INR|₹)\s*([\d,]+\.?\d*)',
+        r'(?:Net\s+)?(?:Amount|Total)\s*[:\-]?\s*(?:Rs\.?|INR|₹)\s*([\d,]+\.?\d*)',
+        r'Amount\s+Payable\s*[:\-]?\s*(?:Rs\.?|INR|₹)\s*([\d,]+\.?\d*)',
+        r'Balance\s+(?:Amount|Due)\s*[:\-]?\s*(?:Rs\.?|INR|₹)\s*([\d,]+\.?\d*)',
+        
+        # Pattern 4: Total without currency symbol
+        r'(?:Grand\s+)?Total\s*[:\-]?\s*([\d,]+\.?\d*)\s*(?:Rs|INR|₹)?',
+        r'(?:Net\s+)?(?:Amount|Total)\s*[:\-]?\s*([\d,]+\.?\d*)\s*(?:Rs|INR|₹)?',
+        
+        # Pattern 5: Last number in Amount column (look for Amount header then find last big number)
+        r'Amount[^\d]*([\d,]+\.?\d*)(?!.*[\d,]{3,})',  # Find last occurrence after "Amount"
+        
+        # Pattern 6: Total in parentheses or brackets
+        r'Total\s*[\(\[]?\s*([\d,]+\.?\d*)\s*[\)\]]?',
+        
+        # Pattern 7: After QTY, RATE columns, look for amount value
+        r'QTY\s+RATE\s+Amount[^\d]*([\d,]+\.?\d*)',
+        
+        # Pattern 8: Fallback - "Total" followed by numbers within next 50 chars
+        r'Total[^\d]{0,50}([\d,]+\.?\d*)',
     ]
     
     for pattern in amount_patterns:
-        match = re.search(pattern, text, re.IGNORECASE | re.MULTILINE)
+        match = re.search(pattern, text, re.IGNORECASE | re.MULTILINE | re.DOTALL)
         if match:
             amount = match.group(1).replace(',', '').strip()
             # Validate it's a reasonable number
             try:
-                float(amount)
-                return amount
+                amount_float = float(amount)
+                # Additional validation: amount should be positive and reasonable
+                if amount_float > 0 and amount_float < 100000000:  # Less than 10 crore
+                    return amount
             except:
                 continue
+    
+    # Fallback: Look for any large number that could be an amount (with comma formatting)
+    # This catches cases where amount is isolated
+    fallback_pattern = r'\b([\d]{1,3}(?:,[\d]{3})+\.?\d*)\b'
+    matches = re.findall(fallback_pattern, text)
+    if matches:
+        # Return the largest number found (likely to be the total)
+        amounts = []
+        for match in matches:
+            try:
+                amt = float(match.replace(',', ''))
+                if amt > 0 and amt < 100000000:
+                    amounts.append(match.replace(',', ''))
+            except:
+                continue
+        if amounts:
+            # Return the last (usually total is at bottom)
+            return amounts[-1]
     
     return ""
 
@@ -267,10 +375,17 @@ def extract_invoice_data(pdf_file):
         with pdfplumber.open(pdf_file) as pdf:
             # Extract text from all pages
             full_text = ""
+            all_tables = []
+            
             for page in pdf.pages:
                 page_text = page.extract_text()
                 if page_text:
                     full_text += page_text + "\n"
+                
+                # Also extract tables for better amount detection
+                tables = page.extract_tables()
+                if tables:
+                    all_tables.extend(tables)
             
             if not full_text.strip():
                 st.warning(f"⚠️ No text found in {pdf_file.name}. It might be a scanned PDF.")
@@ -280,6 +395,11 @@ def extract_invoice_data(pdf_file):
             party_name = extract_party_name(full_text)
             invoice_no, invoice_date = extract_invoice_number_and_date(full_text)
             amount = extract_amount(full_text)
+            
+            # If amount not found in text, try to get it from tables
+            if not amount and all_tables:
+                amount = extract_amount_from_tables(all_tables)
+            
             account_no = extract_account_number(full_text)
             ifsc = extract_ifsc(full_text)
             pan = extract_pan(full_text)
