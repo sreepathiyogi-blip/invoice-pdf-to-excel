@@ -25,11 +25,42 @@ class Token:
         self.next_tokens = next_tokens  # list of up to N next tokens (strings)
 
 
+def _split_glued_dash(token_text):
+    """
+    Split tokens where a label and value are glued together with a dash.
+    e.g. 'no.-450010110017123' → ['no.', '450010110017123']
+         'Code-BKID0004500'   → ['Code', 'BKID0004500']
+         'Name-'              → ['Name']   (trailing dash, no value — drop the dash)
+    Does NOT split things like '3,000.00' or normal hyphenated words.
+    """
+    # Match: <label part> then dash(es) then <value part>
+    # Label part must end with a letter or period; value part must start with
+    # a letter or digit (so we don't break '3,000.00' or 'e-mail')
+    m = re.match(r'^(.*?[A-Za-z.])[-–—]+([A-Za-z0-9].*)$', token_text)
+    if m:
+        label = m.group(1).strip()
+        value = m.group(2).strip()
+        parts = []
+        if label:
+            parts.append(label)
+        if value:
+            parts.append(value)
+        return parts if parts else [token_text]
+
+    # Trailing dash only (like 'no.-' with nothing after) — just strip the dash
+    m2 = re.match(r'^(.*?[A-Za-z.])[-–—]+$', token_text)
+    if m2:
+        label = m2.group(1).strip()
+        return [label] if label else [token_text]
+
+    return [token_text]
+
+
 def tokenize(text, context_window=4):
     """
     Tokenize full-page text into Token objects with positional context.
-    Splits on whitespace but keeps punctuation attached so that values
-    like '3,000.00' or 'BKID0004500' stay intact.
+    Splits on whitespace, then further splits glued label-dash-value tokens
+    (e.g. 'no.-450010110017123') so values can be scored independently.
     """
     tokens = []
     lines = text.split("\n")
@@ -38,7 +69,12 @@ def tokenize(text, context_window=4):
     for line_idx, line in enumerate(lines):
         # Split on whitespace runs
         parts = re.split(r'(\s+)', line)
-        line_tokens_text = [p for p in parts if p.strip()]  # words only
+        raw_tokens = [p for p in parts if p.strip()]
+
+        # Expand any glued dash tokens
+        line_tokens_text = []
+        for t in raw_tokens:
+            line_tokens_text.extend(_split_glued_dash(t))
 
         for tok_idx, tok_text in enumerate(line_tokens_text):
             # Find exact char position within original text
