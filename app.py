@@ -127,6 +127,19 @@ ENTITY_DEFS = {
             "date": 8, "dated": 9, "invoice": 4, "on": 2, "day": 3
         },
         "validate": lambda v: True  # structural validation done in format regex
+    },
+    "PHONE_NUMBER": {
+        # Indian mobile: 10 digits, starts with 6/7/8/9
+        "format": re.compile(r'^[6-9]\d{9}$'),
+        "context_keywords": {
+            "phone": 9, "ph": 7, "tel": 7, "mobile": 9, "mob": 8,
+            "cell": 6, "contact": 5, "fax": 5, "whatsapp": 7,
+            "helpline": 4, "toll": 4, "call": 4,
+            # with colon variants
+            "phone:": 9, "ph:": 7, "tel:": 7, "mobile:": 9, "mob:": 8,
+            "fax:": 5, "contact:": 5, "whatsapp:": 7,
+        },
+        "validate": lambda v: len(v) == 10 and v[0] in '6789'
     }
 }
 
@@ -182,7 +195,7 @@ def score_token_for_entity(token, entity_type):
     line_words = [w.lower() for w in token.line.split()]
     all_context = set(surrounding + line_words)
 
-    if all_context & NEGATIVE_CONTEXT:
+    if all_context & NEGATIVE_CONTEXT and entity_type != "PHONE_NUMBER":
         return 0  # Hard kill — no phone numbers slip through
 
     for keyword, weight in edef["context_keywords"].items():
@@ -514,6 +527,7 @@ def extract_invoice_data(pdf_file, debug_mode=False):
             inv_candidates = find_entity(tokens, "INVOICE_NUMBER")
             date_candidates = find_entity(tokens, "DATE")
             amount_candidates = find_entity(tokens, "AMOUNT")
+            phone_candidates = find_entity(tokens, "PHONE_NUMBER")
 
             # ── Pick best candidate per field ──
             ifsc = ifsc_candidates[0][0].text.upper().strip() if ifsc_candidates else ""
@@ -547,6 +561,13 @@ def extract_invoice_data(pdf_file, debug_mode=False):
             # Party name (specialized extractor)
             party_name, _ = extract_party_name(full_text, tokens)
 
+            # Phone number: pick best candidate, must not collide with account number
+            phone_no = ""
+            for tok, sc in phone_candidates:
+                if tok.text.strip() != acc_no:
+                    phone_no = tok.text.strip()
+                    break
+
             # PAN/GST preference
             pan_gst = pan if pan else gst
 
@@ -558,6 +579,7 @@ def extract_invoice_data(pdf_file, debug_mode=False):
                 "Invoice Date": inv_date,
                 "Invoice No.": inv_no,
                 "Amount": amount,
+                "Phone Number": phone_no,
                 "Bank Name": bank_name,
                 "Bank Account No": acc_no,
                 "IFSC Code": ifsc,
@@ -578,6 +600,7 @@ def extract_invoice_data(pdf_file, debug_mode=False):
                     f"--- Inv  candidates: {[(t.text, s) for t, s in inv_candidates]}\n"
                     f"--- Date candidates: {[(t.text, s) for t, s in date_candidates]}\n"
                     f"--- Amt  candidates: {[(t.text, s) for t, s in amount_candidates]}\n"
+                    f"--- Phn  candidates: {[(t.text, s) for t, s in phone_candidates]}\n"
                     f"--- Party name candidates checked in text\n"
                     f"--- Warnings: {warnings}\n"
                     f"\n--- RAW TEXT (first 3000 chars) ---\n{full_text[:3000]}"
@@ -671,7 +694,8 @@ def main():
             if all_data:
                 columns = [
                     "Party name", "Invoice Date", "Invoice No.", "Amount",
-                    "Bank Name", "Bank Account No", "IFSC Code", "PAN Number / GST"
+                    "Phone Number", "Bank Name", "Bank Account No", "IFSC Code",
+                    "PAN Number / GST"
                 ]
                 df = pd.DataFrame(all_data, columns=columns)
 
