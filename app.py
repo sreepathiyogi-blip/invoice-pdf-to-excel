@@ -102,12 +102,12 @@ ENTITY_DEFS = {
         "validate": lambda v: 9 <= len(v) <= 18 and v.isdigit()
     },
     "INVOICE_NUMBER": {
-        # 2–10 digits (single-digit values are almost never invoice numbers)
-        "format": re.compile(r'^\d{2,10}$'),
+        # 2–7 digits. 8+ digit pure numbers are phone/account territory.
+        "format": re.compile(r'^\d{2,7}$'),
         "context_keywords": {
             "invoice": 9, "no": 5, "number": 4, "bill": 6, "#": 5, "dated": 3
         },
-        "validate": lambda v: 2 <= len(v) <= 10 and v.isdigit()
+        "validate": lambda v: 2 <= len(v) <= 7 and v.isdigit()
     },
     "AMOUNT": {
         # Must have commas OR decimals — bare small integers are not amounts
@@ -129,6 +129,24 @@ ENTITY_DEFS = {
         "validate": lambda v: True  # structural validation done in format regex
     }
 }
+
+# ─────────────────────────────────────────────
+# 2b. NEGATIVE CONTEXT  —  words that KILL a
+#     candidate's score regardless of entity type.
+#     If any of these appear on the same line or
+#     in surrounding tokens, score → 0 instantly.
+# ─────────────────────────────────────────────
+
+NEGATIVE_CONTEXT = {
+    # Phone / contact related
+    "phone", "ph", "ph.", "tel", "tel.", "mobile", "mob", "mob.",
+    "cell", "contact", "fax", "fax.", "helpline", "toll", "whatsapp",
+    "call", "sms", "isd", "std",
+    # Prefixes that appear glued to phone labels
+    "phone:", "ph:", "tel:", "mobile:", "mob:", "fax:", "contact:",
+    "whatsapp:", "helpline:",
+}
+
 
 # ─────────────────────────────────────────────
 # 3.  NLP SCORER  —  scores each candidate token
@@ -157,10 +175,15 @@ def score_token_for_entity(token, entity_type):
     else:
         return 0  # Hard gate: if format doesn't match at all, skip
 
-    # --- Context keyword scoring ---
+    # --- Negative context check (runs before positive scoring) ---
+    # If phone/mobile/contact/fax etc. appear nearby, this token is
+    # almost certainly a phone number — kill it immediately.
     surrounding = [t.lower() for t in token.prev_tokens + token.next_tokens]
-    # Also include the token's own line for broader context
     line_words = [w.lower() for w in token.line.split()]
+    all_context = set(surrounding + line_words)
+
+    if all_context & NEGATIVE_CONTEXT:
+        return 0  # Hard kill — no phone numbers slip through
 
     for keyword, weight in edef["context_keywords"].items():
         kw = keyword.lower()
@@ -435,7 +458,7 @@ def validate_extraction(record):
     if record.get("Bank Account No") and not record.get("IFSC Code"):
         warnings.append("Account Number found but no IFSC Code detected")
 
-    # Invoice number looks suspiciously like an account number (too long)
+    # Invoice number looks suspiciously like a phone/account number (too long)
     inv = record.get("Invoice No.", "")
     if inv and len(inv) > 7:
         warnings.append(f"Invoice No. '{inv}' is unusually long — may be misclassified")
