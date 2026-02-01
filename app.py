@@ -5,110 +5,85 @@ import re
 from io import BytesIO
 from datetime import datetime
 from collections import defaultdict
-import logging
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────
-# 1.  ENHANCED TOKENIZER with better splitting
+# 1.  TOKENIZER  —  splits raw PDF text into
+#     positional, context-aware tokens
 # ─────────────────────────────────────────────
 
 class Token:
     """A single token carrying its text, position, and surrounding context."""
-    __slots__ = ("text", "pos", "line_idx", "line", "prev_tokens", "next_tokens", "font_size", "is_bold")
+    __slots__ = ("text", "pos", "line_idx", "line", "prev_tokens", "next_tokens")
 
-    def __init__(self, text, pos, line_idx, line, prev_tokens, next_tokens, font_size=None, is_bold=False):
+    def __init__(self, text, pos, line_idx, line, prev_tokens, next_tokens):
         self.text = text
-        self.pos = pos
-        self.line_idx = line_idx
-        self.line = line
-        self.prev_tokens = prev_tokens
-        self.next_tokens = next_tokens
-        self.font_size = font_size
-        self.is_bold = is_bold
+        self.pos = pos                  # character offset in full text
+        self.line_idx = line_idx        # which line it came from
+        self.line = line                # the full line string
+        self.prev_tokens = prev_tokens  # list of up to N previous tokens (strings)
+        self.next_tokens = next_tokens  # list of up to N next tokens (strings)
 
 
-def _split_glued_patterns(token_text):
+def _split_glued_dash(token_text):
     """
-    Enhanced splitting for various glued patterns:
-    - Label-value: 'no.-450010110017123', 'Code-BKID0004500'
-    - Label:value: 'Invoice:12345', 'Date:01-Jan-24'
-    - Label/value: 'GST/15AABCD1234E1Z5'
-    - Preserves: '3,000.00', 'email@domain.com', normal hyphenated words
+    Split tokens where a label and value are glued together with a dash.
+    e.g. 'no.-450010110017123' → ['no.', '450010110017123']
+         'Code-BKID0004500'   → ['Code', 'BKID0004500']
+         'Name-'              → ['Name']   (trailing dash, no value — drop the dash)
+    Does NOT split things like '3,000.00' or normal hyphenated words.
     """
-    parts = []
-    
-    # Pattern 1: Label-Value (with dash)
+    # Match: <label part> then dash(es) then <value part>
+    # Label part must end with a letter or period; value part must start with
+    # a letter or digit (so we don't break '3,000.00' or 'e-mail')
     m = re.match(r'^(.*?[A-Za-z.])[-–—]+([A-Za-z0-9].*)$', token_text)
     if m:
         label = m.group(1).strip()
         value = m.group(2).strip()
-        if label and value:
-            return [label, value]
+        parts = []
         if label:
-            return [label]
-    
-    # Pattern 2: Label:Value (with colon)
-    m = re.match(r'^(.*?[A-Za-z.]):([A-Za-z0-9].*)$', token_text)
-    if m:
-        label = m.group(1).strip()
-        value = m.group(2).strip()
-        if label and value:
-            return [label, value]
-    
-    # Pattern 3: Label/Value (with slash, not email/URL)
-    if '/' in token_text and '@' not in token_text and '://' not in token_text:
-        m = re.match(r'^([A-Za-z]+)/(.+)$', token_text)
-        if m:
-            label = m.group(1).strip()
-            value = m.group(2).strip()
-            if label and value and len(label) > 1:
-                return [label, value]
-    
-    # Pattern 4: Trailing dash/colon only
-    m = re.match(r'^(.*?[A-Za-z.])[:–—-]+$', token_text)
-    if m:
-        label = m.group(1).strip()
+            parts.append(label)
+        if value:
+            parts.append(value)
+        return parts if parts else [token_text]
+
+    # Trailing dash only (like 'no.-' with nothing after) — just strip the dash
+    m2 = re.match(r'^(.*?[A-Za-z.])[-–—]+$', token_text)
+    if m2:
+        label = m2.group(1).strip()
         return [label] if label else [token_text]
-    
+
     return [token_text]
 
 
-def tokenize(text, context_window=6):
+def tokenize(text, context_window=4):
     """
-    Enhanced tokenization with better pattern recognition and context preservation.
+    Tokenize full-page text into Token objects with positional context.
+    Splits on whitespace, then further splits glued label-dash-value tokens
+    (e.g. 'no.-450010110017123') so values can be scored independently.
     """
     tokens = []
     lines = text.split("\n")
     char_offset = 0
 
     for line_idx, line in enumerate(lines):
-        if not line.strip():
-            char_offset += len(line) + 1
-            continue
-            
         # Split on whitespace runs
         parts = re.split(r'(\s+)', line)
         raw_tokens = [p for p in parts if p.strip()]
 
-        # Expand any glued patterns
+        # Expand any glued dash tokens
         line_tokens_text = []
         for t in raw_tokens:
-            line_tokens_text.extend(_split_glued_patterns(t))
+            line_tokens_text.extend(_split_glued_dash(t))
 
         for tok_idx, tok_text in enumerate(line_tokens_text):
-            # Find exact char position
+            # Find exact char position within original text
             pos = text.find(tok_text, char_offset)
             if pos == -1:
-                pos = char_offset
+                pos = char_offset  # fallback
 
             prev = line_tokens_text[max(0, tok_idx - context_window):tok_idx]
             nxt = line_tokens_text[tok_idx + 1:tok_idx + 1 + context_window]
-
-            # Detect if this might be bold/header (ALL CAPS, or line position)
-            is_bold = tok_text.isupper() and len(tok_text) > 2
 
             tokens.append(Token(
                 text=tok_text,
@@ -116,159 +91,99 @@ def tokenize(text, context_window=6):
                 line_idx=line_idx,
                 line=line,
                 prev_tokens=prev,
-                next_tokens=nxt,
-                is_bold=is_bold
+                next_tokens=nxt
             ))
             char_offset = pos + len(tok_text)
 
-        char_offset += 1  # newline
+        char_offset += len(line) + 1  # +1 for the newline
 
     return tokens
 
 
 # ─────────────────────────────────────────────
-# 2.  ENHANCED ENTITY DEFINITIONS with more patterns
+# 2.  ENTITY DEFINITIONS  —  each entity type
+#     has: format regex, context keywords (with
+#     weights), and validation rules
 # ─────────────────────────────────────────────
 
 ENTITY_DEFS = {
     "IFSC": {
-        "format": [
-            re.compile(r'^[A-Z]{4}0[0-9A-Z]{6}$', re.IGNORECASE),  # Standard IFSC
-            re.compile(r'^[A-Z]{4}[0-9]{7}$', re.IGNORECASE),      # Common variant
-        ],
+        "format": re.compile(r'^[A-Z]{4}[0-9]{7}$', re.IGNORECASE),
         "context_keywords": {
-            "ifsc": 10, "code": 4, "bank": 5, "branch": 4,
-            "rtgs": 3, "neft": 3, "imps": 3, "swift": 2
+            "ifsc": 8, "code": 3, "bank": 4, "branch": 3
         },
-        "validate": lambda v: len(v) == 11 and re.match(r'^[A-Z]{4}[0-9A-Z]{7}$', v.upper()),
-        "priority": 9
+        "validate": lambda v: len(v) == 11 and re.match(r'^[A-Z]{4}\d{7}$', v.upper())
     },
     "PAN": {
-        "format": [
-            re.compile(r'^[A-Z]{5}[0-9]{4}[A-Z]$', re.IGNORECASE),
-            re.compile(r'^[A-Z]{3}[ABCFGHLJPT][A-Z]\d{4}[A-Z]$', re.IGNORECASE),  # Strict PAN pattern
-        ],
+        "format": re.compile(r'^[A-Z]{5}[0-9]{4}[A-Z]$', re.IGNORECASE),
         "context_keywords": {
-            "pan": 10, "permanent": 6, "account": 4, "number": 3,
-            "tin": 5, "tax": 3, "payer": 2
+            "pan": 9, "permanent": 5, "account": 3, "number": 2, "tin": 4
         },
-        "validate": lambda v: len(v) == 10 and re.match(r'^[A-Z]{5}\d{4}[A-Z]$', v.upper()),
-        "priority": 8
+        "validate": lambda v: len(v) == 10 and re.match(r'^[A-Z]{5}\d{4}[A-Z]$', v.upper())
     },
     "GST": {
-        "format": [
-            re.compile(r'^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][1-9A-Z][Z][0-9A-Z]$', re.IGNORECASE),
-            re.compile(r'^[0-9]{2}[A-Z]{3}[ABCFGHLJPT][A-Z]\d{4}[A-Z][1-9A-Z]Z[0-9A-Z]$', re.IGNORECASE),
-        ],
+        "format": re.compile(r'^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][1-9A-Z][Z][0-9A-Z]$', re.IGNORECASE),
         "context_keywords": {
-            "gst": 10, "gstin": 12, "tin": 6, "tax": 5,
-            "identification": 4, "vat": 3, "registration": 3
+            "gst": 9, "gstin": 10, "tin": 5, "tax": 4, "identification": 3
         },
-        "validate": lambda v: len(v) == 15 and v[2:12].isalnum(),
-        "priority": 8
+        "validate": lambda v: len(v) == 15
     },
     "ACCOUNT_NUMBER": {
-        "format": [
-            re.compile(r'^\d{9,18}$'),                    # Standard account numbers
-            re.compile(r'^[A-Z]{2}\d{7,16}$'),           # Some banks prefix with letters
-            re.compile(r'^\d{4}[-\s]?\d{4}[-\s]?\d{4,10}$'),  # Formatted with separators
-        ],
+        # Indian bank account numbers: 9–18 digits
+        "format": re.compile(r'^\d{9,18}$'),
         "context_keywords": {
-            "account": 10, "number": 5, "ac": 8, "a/c": 10, "acc": 8,
-            "bank": 6, "holder": 4, "no": 4, "saving": 3, "current": 3,
-            "beneficiary": 5, "payee": 4
+            "account": 8, "number": 4, "ac": 7, "a/c": 9, "acc": 7,
+            "bank": 5, "holder": 3, "no": 3
         },
-        "validate": lambda v: 9 <= len(re.sub(r'[-\s]', '', v)) <= 18 and re.sub(r'[-\s]', '', v).isdigit(),
-        "priority": 7
+        "validate": lambda v: 9 <= len(v) <= 18 and v.isdigit()
     },
     "INVOICE_NUMBER": {
-        "format": [
-            re.compile(r'^\d{2,7}$'),                           # Pure numeric
-            re.compile(r'^[A-Z]{1,4}[-/]?\d{2,7}$', re.IGNORECASE),  # Prefix-Number
-            re.compile(r'^\d{2,4}[-/]\d{2,4}[-/]?\d{0,4}$'),   # Date-style invoice nums
-            re.compile(r'^INV[-/]?\d{2,7}$', re.IGNORECASE),   # INV prefix
-            re.compile(r'^[A-Z0-9]{4,12}$', re.IGNORECASE),    # Alphanumeric
-        ],
+        # 2–7 digits. 8+ digit pure numbers are phone/account territory.
+        "format": re.compile(r'^\d{2,7}$'),
         "context_keywords": {
-            "invoice": 12, "no": 6, "number": 5, "bill": 8, "#": 6,
-            "dated": 4, "inv": 10, "voucher": 3, "ref": 3, "reference": 3
+            "invoice": 9, "no": 5, "number": 4, "bill": 6, "#": 5, "dated": 3
         },
-        "validate": lambda v: 2 <= len(re.sub(r'[-/\s]', '', v)) <= 15,
-        "priority": 6
+        "validate": lambda v: 2 <= len(v) <= 7 and v.isdigit()
     },
     "AMOUNT": {
-        "format": [
-            re.compile(r'^(\d{1,3}(,\d{3})+(\.\d{1,2})?|\d+\.\d{1,2})$'),  # With comma/decimal
-            re.compile(r'^₹?\s*(\d{1,3}(,\d{3})+(\.\d{1,2})?|\d+\.\d{1,2})$'),  # With rupee symbol
-            re.compile(r'^(Rs\.?|INR)?\s*(\d{1,3}(,\d{3})+(\.\d{1,2})?|\d+\.\d{1,2})$', re.IGNORECASE),
-            re.compile(r'^\d{4,}$'),  # Large numbers without formatting (backup)
-        ],
+        # Must have commas OR decimals — bare small integers are not amounts
+        "format": re.compile(r'^(\d{1,3}(,\d{3})+(\.\d{1,2})?|\d+\.\d{1,2})$'),
         "context_keywords": {
-            "amount": 12, "total": 10, "grand": 8, "net": 6, "payable": 10,
-            "balance": 7, "due": 6, "rs": 5, "inr": 5, "₹": 8,
-            "rate": 3, "value": 4, "sum": 5, "payment": 6,
-            "taxable": 4, "subtotal": 5, "outstanding": 5
+            "amount": 9, "total": 7, "grand": 5, "net": 4, "payable": 6,
+            "balance": 5, "due": 4, "rs": 3, "inr": 3, "₹": 4, "rate": 2
         },
-        "validate": lambda v: float(re.sub(r'[^\d.]', '', v)) >= 1,
-        "priority": 8
+        "validate": lambda v: float(v.replace(',', '')) >= 10
     },
     "DATE": {
-        "format": [
-            re.compile(r'^\d{1,2}[-./]\s*([A-Za-z]{3}|\d{1,2})\s*[-./]\d{2,4}$'),  # DD-Mon-YY
-            re.compile(r'^\d{1,2}[-./]\d{1,2}[-./]\d{2,4}$'),                        # DD/MM/YYYY
-            re.compile(r'^\d{4}[-./]\d{1,2}[-./]\d{1,2}$'),                          # YYYY-MM-DD
-            re.compile(r'^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2},?\s+\d{4}', re.IGNORECASE),  # Mon DD, YYYY
-            re.compile(r'^\d{1,2}\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{2,4}', re.IGNORECASE),  # DD Mon YYYY
-        ],
+        # DD-Mon-YY, DD/MM/YYYY, DD.MM.YYYY, etc.
+        "format": re.compile(
+            r'^\d{1,2}[-./]\s*([A-Za-z]{3}|\d{1,2})\s*[-./]\d{2,4}$'
+        ),
         "context_keywords": {
-            "date": 10, "dated": 12, "invoice": 5, "on": 3, "day": 4,
-            "issued": 6, "created": 4, "generated": 4, "dt": 6
+            "date": 8, "dated": 9, "invoice": 4, "on": 2, "day": 3
         },
-        "validate": lambda v: True,
-        "priority": 7
+        "validate": lambda v: True  # structural validation done in format regex
     },
     "PHONE_NUMBER": {
-        "format": [
-            re.compile(r'^[6-9]\d{9}$'),                              # Indian mobile
-            re.compile(r'^0\d{10}$'),                                 # With leading 0
-            re.compile(r'^\+91[-\s]?[6-9]\d{9}$'),                   # With +91
-            re.compile(r'^91[-\s]?[6-9]\d{9}$'),                     # With 91
-            re.compile(r'^(\+91|91|0)?[-\s]?\d{5}[-\s]?\d{5}$'),    # Formatted
-        ],
+        # Indian mobile: 10 digits, starts with 6/7/8/9
+        "format": re.compile(r'^[6-9]\d{9}$'),
         "context_keywords": {
-            "phone": 12, "ph": 9, "tel": 9, "mobile": 12, "mob": 10,
-            "cell": 8, "contact": 7, "fax": 7, "whatsapp": 9,
-            "helpline": 5, "toll": 5, "call": 5,
-            "phone:": 12, "ph:": 9, "tel:": 9, "mobile:": 12, "mob:": 10,
-            "fax:": 7, "contact:": 7, "whatsapp:": 9,
+            "phone": 9, "ph": 7, "tel": 7, "mobile": 9, "mob": 8,
+            "cell": 6, "contact": 5, "fax": 5, "whatsapp": 7,
+            "helpline": 4, "toll": 4, "call": 4,
+            # with colon variants
+            "phone:": 9, "ph:": 7, "tel:": 7, "mobile:": 9, "mob:": 8,
+            "fax:": 5, "contact:": 5, "whatsapp:": 7,
         },
-        "validate": lambda v: 10 <= len(re.sub(r'[^\d]', '', v)) <= 12,
-        "priority": 5
-    },
-    "EMAIL": {
-        "format": [
-            re.compile(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'),
-        ],
-        "context_keywords": {
-            "email": 12, "e-mail": 10, "mail": 6, "contact": 4, "@": 10
-        },
-        "validate": lambda v: '@' in v and '.' in v.split('@')[1],
-        "priority": 6
-    },
-    "PINCODE": {
-        "format": [
-            re.compile(r'^\d{6}$'),
-        ],
-        "context_keywords": {
-            "pin": 10, "pincode": 12, "postal": 8, "zip": 6, "code": 4
-        },
-        "validate": lambda v: len(v) == 6 and v.isdigit(),
-        "priority": 4
-    },
+        "validate": lambda v: len(v) == 10 and v[0] in '6789'
+    }
 }
 
 # ─────────────────────────────────────────────
-# 2b. ENHANCED NEGATIVE CONTEXT
+# 2b. NEGATIVE CONTEXT  —  words that KILL a
+#     candidate's score regardless of entity type.
+#     If any of these appear on the same line or
+#     in surrounding tokens, score → 0 instantly.
 # ─────────────────────────────────────────────
 
 NEGATIVE_CONTEXT = {
@@ -276,456 +191,275 @@ NEGATIVE_CONTEXT = {
     "phone", "ph", "ph.", "tel", "tel.", "mobile", "mob", "mob.",
     "cell", "contact", "fax", "fax.", "helpline", "toll", "whatsapp",
     "call", "sms", "isd", "std",
+    # Prefixes that appear glued to phone labels
     "phone:", "ph:", "tel:", "mobile:", "mob:", "fax:", "contact:",
     "whatsapp:", "helpline:",
-    
-    # Document metadata (should not be account numbers)
-    "page", "of", "copy", "original", "duplicate", "triplicate",
-    
-    # Pin codes (should not be invoice numbers)
-    "pin", "pincode", "postal", "zip",
 }
 
+
 # ─────────────────────────────────────────────
-# 3.  ENHANCED NLP SCORER with priority weighting
+# 3.  NLP SCORER  —  scores each candidate token
+#     by combining format match + context signal
 # ─────────────────────────────────────────────
 
 def score_token_for_entity(token, entity_type):
     """
-    Enhanced scoring with:
-    - Multiple format pattern support
-    - Priority-based scoring
-    - Position-aware bonuses
-    - Stricter negative context checking
+    Returns a confidence score (0–100) for how likely this token
+    is the target entity.
+
+    Score components:
+      - Format match:      +50 if the token text matches the entity's format regex
+      - Context keywords:  +N  for each keyword found in surrounding tokens
+                           (weighted per keyword definition)
+      - Position bonus:    +5  if keyword is immediately adjacent (prev/next[0])
+      - Penalty:           -30 if the token matches a DIFFERENT entity's format
+                           (e.g., an IFSC code shouldn't be picked as PAN)
     """
     edef = ENTITY_DEFS[entity_type]
     score = 0
 
-    # --- Format match (try all patterns) ---
-    format_matched = False
-    format_patterns = edef["format"] if isinstance(edef["format"], list) else [edef["format"]]
-    
-    for pattern in format_patterns:
-        if pattern.match(token.text.strip()):
-            format_matched = True
-            score += 50
-            break
-    
-    if not format_matched:
-        return 0
+    # --- Format match ---
+    if edef["format"].match(token.text.strip()):
+        score += 50
+    else:
+        return 0  # Hard gate: if format doesn't match at all, skip
 
-    # --- Negative context check ---
+    # --- Negative context check (runs before positive scoring) ---
+    # If phone/mobile/contact/fax etc. appear nearby, this token is
+    # almost certainly a phone number — kill it immediately.
     surrounding = [t.lower() for t in token.prev_tokens + token.next_tokens]
-    line_words = [w.lower() for w in re.split(r'\W+', token.line)]
+    line_words = [w.lower() for w in token.line.split()]
     all_context = set(surrounding + line_words)
 
-    # Kill score if negative context found (unless it's the matching entity type)
-    if entity_type != "PHONE_NUMBER":
-        if all_context & NEGATIVE_CONTEXT:
-            return 0
-    
-    # For phone numbers, require positive context
-    if entity_type == "PHONE_NUMBER":
-        has_phone_context = any(kw in all_context for kw in 
-                               ["phone", "mobile", "tel", "contact", "mob", "fax", "whatsapp"])
-        if not has_phone_context:
-            return 0
+    if all_context & NEGATIVE_CONTEXT and entity_type != "PHONE_NUMBER":
+        return 0  # Hard kill — no phone numbers slip through
 
-    # --- Positive context keywords ---
     for keyword, weight in edef["context_keywords"].items():
         kw = keyword.lower()
-        
-        # Check in surrounding tokens (high value)
-        if kw in [t.lower() for t in surrounding]:
+        if kw in surrounding:
             score += weight
-            
-            # Immediate adjacency bonus
-            if token.prev_tokens and token.prev_tokens[-1].lower() == kw:
-                score += 8
-            if token.next_tokens and token.next_tokens[0].lower() == kw:
-                score += 8
-        
-        # Check in line words (medium value)
+            # Bonus for immediate adjacency
+            if token.prev_tokens and token.prev_tokens[-1].lower().startswith(kw):
+                score += 5
+            if token.next_tokens and token.next_tokens[0].lower().startswith(kw):
+                score += 5
         elif kw in line_words:
-            score += weight * 0.5
-    
-    # --- Position bonuses ---
-    # Values at start of line often indicate labels
-    if token.pos == 0 or (token.prev_tokens and token.prev_tokens[-1] in [':', '-', '–']):
-        score += 5
-    
-    # Bold/header text bonus (for party names, dates, invoice numbers)
-    if token.is_bold and entity_type in ["DATE", "INVOICE_NUMBER"]:
-        score += 10
+            # Weaker signal: keyword is on same line but not immediately adjacent
+            score += weight * 0.4
 
-    # --- Cross-entity penalty (avoid ambiguity) ---
+    # --- Cross-entity penalty ---
+    # If this token also matches a different entity's format strongly,
+    # reduce confidence to avoid ambiguity (e.g., long digit strings)
     for other_type, odef in ENTITY_DEFS.items():
         if other_type == entity_type:
             continue
-        
-        # Check if this token matches another entity's format
-        other_patterns = odef["format"] if isinstance(odef["format"], list) else [odef["format"]]
-        for pattern in other_patterns:
-            if pattern.match(token.text.strip()):
-                # Calculate context score for other entity
-                other_context_score = 0
-                for kw, w in odef["context_keywords"].items():
-                    if kw.lower() in all_context:
-                        other_context_score += w
-                
-                # Apply penalty if other entity has strong context
-                if other_context_score > 10:
-                    score -= 25
-                elif other_context_score > 5:
-                    score -= 15
-                break
-
-    # --- Priority boost ---
-    priority_boost = edef.get("priority", 5)
-    score += priority_boost
+        if odef["format"].match(token.text.strip()):
+            # Only penalize if the other entity has stronger context here
+            other_context_score = 0
+            for kw, w in odef["context_keywords"].items():
+                if kw.lower() in surrounding or kw.lower() in line_words:
+                    other_context_score += w
+            if other_context_score > 5:
+                score -= 20
 
     return max(score, 0)
 
 
-def find_entity(tokens, entity_type, top_n=5):
+def find_entity(tokens, entity_type, top_n=3):
     """
-    Enhanced entity finder with deduplication and better ranking.
+    Score all tokens for a given entity type and return the top candidates
+    sorted by score descending.  Each result is (token, score).
     """
     candidates = []
     seen_values = set()
 
     for token in tokens:
+        # Deduplicate: only score each unique value once
         clean = token.text.strip()
-        clean_normalized = re.sub(r'[-\s]', '', clean).upper()
-        
-        # Skip duplicates
-        if clean_normalized in seen_values:
+        if clean in seen_values:
             continue
-        seen_values.add(clean_normalized)
+        seen_values.add(clean)
 
         s = score_token_for_entity(token, entity_type)
         if s > 0:
             candidates.append((token, s))
 
-    # Sort by score descending
     candidates.sort(key=lambda x: x[1], reverse=True)
     return candidates[:top_n]
 
 
 # ─────────────────────────────────────────────
-# 4.  ENHANCED SPECIALIZED EXTRACTORS
+# 4.  SPECIALIZED EXTRACTORS  —  for fields that
+#     need more than token-level scoring (party
+#     name, amount from tables)
 # ─────────────────────────────────────────────
 
 def extract_party_name(text, tokens):
     """
-    Enhanced party name extraction with multiple strategies:
-    1. Account Holder label detection
-    2. Header company name (lines 1-8)
-    3. Post-INVOICE keyword extraction
-    4. Bold/ALL CAPS text in header
-    5. Pattern-based company name detection (Pvt Ltd, LLP, etc.)
+    Party name extraction uses a multi-strategy approach:
+      1. Look for 'Account Holder' label and grab the next non-keyword line
+      2. Look for a capitalized name in lines 1–6 of the header
+      3. Look for a name right after 'INVOICE' heading
+    Scored by: all-caps likelihood, length reasonableness, absence of
+    numeric/keyword pollution.
     """
-    candidates = []
+    candidates = []  # (name, score)
+
     lines = text.split("\n")
 
-    # --- Strategy 1: Account Holder ---
+    # --- Strategy 1: Account Holder block ---
     for i, line in enumerate(lines):
-        if re.search(r'account\s+holder|beneficiary|payee', line, re.IGNORECASE):
+        if re.search(r'account\s+holder', line, re.IGNORECASE):
+            # Check this line and next 2 lines for a name
             for j in range(i, min(i + 3, len(lines))):
                 candidate = re.sub(
-                    r'(account\s+holder|beneficiary|payee|name|:|-)', 
-                    '', lines[j], flags=re.IGNORECASE
+                    r'(account\s+holder|name|:|-)', '', lines[j], flags=re.IGNORECASE
                 ).strip()
-                if candidate and re.match(r'^[A-Za-z\s\.&,\-]+$', candidate) and 3 < len(candidate) < 100:
-                    score = 50
+                if candidate and re.match(r'^[A-Za-z\s\.]+$', candidate) and 3 < len(candidate) < 80:
+                    score = 40
                     if candidate.isupper():
-                        score += 15
+                        score += 10  # All-caps names are common in Indian invoices
                     candidates.append((candidate, score))
 
-    # --- Strategy 2: Company suffixes (Pvt Ltd, LLP, etc.) ---
-    company_suffixes = [
-        r'pvt\.?\s*ltd\.?', r'private\s+limited', r'llp', 
-        r'limited', r'ltd\.?', r'inc\.?', r'corporation',
-        r'enterprises', r'industries', r'traders'
-    ]
-    for i, line in enumerate(lines[:15]):  # Check first 15 lines
+    # --- Strategy 2: Header name (lines 1–6) ---
+    for i, line in enumerate(lines[:7]):
         line = line.strip()
-        for suffix_pattern in company_suffixes:
-            if re.search(suffix_pattern, line, re.IGNORECASE):
-                # This line likely contains company name
-                clean = re.sub(r'(INVOICE|BILL|TAX|GST|PAN).*$', '', line, flags=re.IGNORECASE).strip()
-                if 5 < len(clean) < 100:
-                    score = 60
-                    if line.isupper():
-                        score += 10
-                    if i <= 5:
-                        score += 15  # Early in document
-                    candidates.append((clean, score))
-                    break
-
-    # --- Strategy 3: Header name (lines 1-8) ---
-    for i, line in enumerate(lines[:8]):
-        line = line.strip()
-        if not line or len(line) < 5:
+        if not line:
             continue
-        
-        # Must be mostly alphabetic
-        if re.match(r'^[A-Z][A-Za-z\s\.&,\-()]+$', line) and 5 < len(line) < 80:
-            # Skip obvious labels/headers
-            skip_words = [
-                'invoice', 'phone', 'email', 'address', 'gst', 'pan',
-                'date', 'total', 'amount', 'bank', 'ifsc', 'bill',
-                'tax', 'original', 'copy', 'page'
-            ]
+        # Must be mostly alphabetic, reasonable length
+        if re.match(r'^[A-Z][A-Za-z\s\.&,\-]+$', line) and 3 < len(line) < 60:
+            # Skip lines that look like labels or headers
+            skip_words = ['invoice', 'phone', 'email', 'address', 'gst', 'pan',
+                          'date', 'total', 'amount', 'bank', 'ifsc']
             if any(sw in line.lower() for sw in skip_words):
                 continue
-            
-            score = 35
+            score = 25
             if i <= 2:
-                score += 20  # Very early lines
+                score += 10  # Earlier lines are more likely to be the company name
             if line.isupper():
-                score += 10
-            if len(line) > 15:  # Reasonable company name length
                 score += 5
-            
             candidates.append((line, score))
 
-    # --- Strategy 4: Post-INVOICE keyword ---
+    # --- Strategy 3: Name right after INVOICE keyword ---
     for i, line in enumerate(lines):
-        if re.match(r'^\s*INVOICE\b', line.strip(), re.IGNORECASE):
-            for j in range(i + 1, min(i + 4, len(lines))):
+        if re.match(r'^INVOICE\b', line.strip(), re.IGNORECASE):
+            # Check next 1-2 non-empty lines
+            for j in range(i + 1, min(i + 3, len(lines))):
                 candidate = lines[j].strip()
-                if (candidate and 
-                    re.match(r'^[A-Z][A-Za-z\s\.&,\-]+$', candidate) and 
-                    5 < len(candidate) < 80):
-                    candidates.append((candidate, 40))
+                if candidate and re.match(r'^[A-Z][A-Za-z\s\.&]+$', candidate) and 3 < len(candidate) < 60:
+                    candidates.append((candidate, 30))
                     break
-
-    # --- Strategy 5: ALL CAPS lines in header ---
-    for i, line in enumerate(lines[:10]):
-        if line.strip().isupper() and 8 < len(line.strip()) < 80:
-            clean = re.sub(r'(INVOICE|BILL|ORIGINAL|COPY|PAGE|\d+)', '', line).strip()
-            if len(clean) > 5:
-                score = 30
-                if i <= 3:
-                    score += 15
-                candidates.append((clean, score))
 
     if not candidates:
         return "", 0
 
-    # Remove duplicates and pick best
-    seen = set()
-    unique_candidates = []
-    for name, score in candidates:
-        normalized = name.upper().strip()
-        if normalized not in seen:
-            seen.add(normalized)
-            unique_candidates.append((name, score))
-
-    unique_candidates.sort(key=lambda x: x[1], reverse=True)
-    return unique_candidates[0]
+    # Pick highest-scored candidate
+    candidates.sort(key=lambda x: x[1], reverse=True)
+    return candidates[0]
 
 
 def extract_amount_from_tables(tables):
     """
-    Enhanced table amount extraction:
-    - Multiple column name variations
-    - Better numeric parsing
-    - Grand total / final total detection
-    - Row position scoring (last row often = total)
+    Table-aware amount extraction.  Looks for an 'Amount' column header,
+    then collects all numeric values in that column.  Scores them by:
+      - Proper currency format (X,XXX.XX) → high score
+      - Larger value → slight preference (totals tend to be at the bottom / largest)
+      - Position: last value in an Amount column is often the total
     """
     candidates = []
-    
-    amount_keywords = [
-        'amount', 'total', 'grand total', 'net amount', 
-        'payable', 'balance', 'due', 'sum', 'value',
-        'subtotal', 'invoice amount', 'bill amount'
-    ]
 
-    for table_idx, table in enumerate(tables):
-        if not table or len(table) < 2:
+    for table in tables:
+        if not table:
             continue
 
         amount_col_idx = None
-        header_row_idx = 0
 
-        # Find amount column header
-        for row_idx, row in enumerate(table[:5]):  # Check first 5 rows for headers
+        for row_idx, row in enumerate(table):
             if not row:
                 continue
 
+            # Detect Amount column header
             for col_idx, cell in enumerate(row):
-                cell_text = str(cell).lower().strip() if cell else ""
-                if any(keyword in cell_text for keyword in amount_keywords):
+                if cell and re.search(r'amount', str(cell), re.IGNORECASE):
                     amount_col_idx = col_idx
-                    header_row_idx = row_idx
                     break
-            
-            if amount_col_idx is not None:
-                break
 
-        # Extract amounts from the column
-        if amount_col_idx is not None:
-            for row_idx, row in enumerate(table[header_row_idx + 1:], start=header_row_idx + 1):
-                if amount_col_idx >= len(row) or not row[amount_col_idx]:
-                    continue
-                
-                raw = re.sub(r'[^\d,.]', '', str(row[amount_col_idx]).strip())
-                if not raw or raw.count('.') > 1:
-                    continue
-                
-                try:
-                    val = float(raw.replace(',', ''))
-                    if 1 <= val < 1e10:
-                        score = 15
-                        
-                        # Decimal formatting bonus
-                        if '.' in raw:
-                            score += 20
-                        
-                        # Perfect currency format
-                        if re.match(r'^\d{1,3}(,\d{3})*\.\d{2}$', raw):
-                            score += 30
-                        
-                        # Last row in table = often the total
-                        if row_idx == len(table) - 1:
-                            score += 40
-                        
-                        # Check if row label indicates total
-                        row_text = ' '.join([str(c) for c in row if c]).lower()
-                        if any(word in row_text for word in ['total', 'grand', 'net', 'payable']):
-                            score += 50
-                        
-                        candidates.append((raw, score, val))
-                except (ValueError, TypeError):
-                    continue
+            # Once we have the column, pull all numeric values below it
+            if amount_col_idx is not None:
+                for sub_row in table[row_idx + 1:]:
+                    if amount_col_idx < len(sub_row) and sub_row[amount_col_idx]:
+                        raw = re.sub(r'[^\d,.]', '', str(sub_row[amount_col_idx]).strip())
+                        if not raw:
+                            continue
+                        try:
+                            val = float(raw.replace(',', ''))
+                            if 10 <= val < 1e8:
+                                score = 10
+                                if '.' in raw:
+                                    score += 15   # Has decimals → likely a real amount
+                                if re.match(r'^\d{1,3}(,\d{3})*\.\d{2}$', raw):
+                                    score += 20   # Perfect currency format
+                                candidates.append((raw.replace(',', ''), score, val))
+                        except ValueError:
+                            continue
+                # Reset so we don't re-trigger on next row
+                amount_col_idx = None
 
     if not candidates:
         return "", 0
 
-    # Sort by score desc, then value desc
+    # Sort by score desc, then by value desc (prefer totals)
     candidates.sort(key=lambda x: (x[1], x[2]), reverse=True)
-    best_amount = candidates[0][0].replace(',', '')
-    
-    # Ensure proper decimal formatting
-    if '.' not in best_amount:
-        best_amount = f"{best_amount}.00"
-    
-    return best_amount, candidates[0][1]
-
-
-def extract_address(text, lines):
-    """
-    Extract address using common patterns:
-    - After keywords like 'Address:', 'Bill To:', 'Ship To:'
-    - Multi-line addresses with pin codes
-    """
-    candidates = []
-    
-    address_keywords = ['address', 'bill to', 'ship to', 'billing address', 'shipping address']
-    
-    for i, line in enumerate(lines):
-        line_lower = line.lower().strip()
-        
-        # Check if this line contains an address keyword
-        if any(kw in line_lower for kw in address_keywords):
-            # Collect next 3-6 lines as potential address
-            address_lines = []
-            for j in range(i + 1, min(i + 7, len(lines))):
-                addr_line = lines[j].strip()
-                if addr_line and len(addr_line) > 3:
-                    # Stop if we hit another section header
-                    if re.match(r'^(INVOICE|BILL|GST|PAN|AMOUNT)', addr_line, re.IGNORECASE):
-                        break
-                    address_lines.append(addr_line)
-            
-            if address_lines:
-                full_address = ', '.join(address_lines[:5])  # Max 5 lines
-                candidates.append((full_address, 50))
-    
-    if candidates:
-        candidates.sort(key=lambda x: x[1], reverse=True)
-        return candidates[0][0]
-    
-    return ""
+    return candidates[0][0], candidates[0][1]
 
 
 # ─────────────────────────────────────────────
-# 5.  ENHANCED DATE NORMALIZER
+# 5.  DATE NORMALIZER
 # ─────────────────────────────────────────────
 
 MONTH_MAP = {
-    'jan': '01', 'january': '01',
-    'feb': '02', 'february': '02',
-    'mar': '03', 'march': '03',
-    'apr': '04', 'april': '04',
-    'may': '05',
-    'jun': '06', 'june': '06',
-    'jul': '07', 'july': '07',
-    'aug': '08', 'august': '08',
-    'sep': '09', 'sept': '09', 'september': '09',
-    'oct': '10', 'october': '10',
-    'nov': '11', 'november': '11',
-    'dec': '12', 'december': '12'
+    'jan': '01', 'feb': '02', 'mar': '03', 'apr': '04',
+    'may': '05', 'jun': '06', 'jul': '07', 'aug': '08',
+    'sep': '09', 'oct': '10', 'nov': '11', 'dec': '12'
 }
 
 
 def normalize_date(date_str):
-    """Enhanced date normalization handling multiple formats."""
+    """Normalize any detected date to DD-MM-YYYY."""
     if not date_str:
         return ""
-    
-    date_str = date_str.strip()
-    
-    # Pattern 1: DD-Mon-YY or DD-Mon-YYYY
-    m = re.match(r'(\d{1,2})[-./\s]+([A-Za-z]{3,9})[-./\s]+(\d{2,4})', date_str, re.IGNORECASE)
+
+    # DD-Mon-YY or DD-Mon-YYYY
+    m = re.match(r'(\d{1,2})[-./]\s*([A-Za-z]{3})\s*[-./](\d{2,4})', date_str)
     if m:
         day = m.group(1).zfill(2)
-        month = MONTH_MAP.get(m.group(2).lower()[:3], '01')
+        month = MONTH_MAP.get(m.group(2).lower(), '01')
         year = m.group(3)
         if len(year) == 2:
-            year = '20' + year if int(year) <= 50 else '19' + year
+            year = '20' + year
         return f"{day}-{month}-{year}"
-    
-    # Pattern 2: Mon DD, YYYY
-    m = re.match(r'([A-Za-z]{3,9})\s+(\d{1,2}),?\s+(\d{4})', date_str, re.IGNORECASE)
-    if m:
-        month = MONTH_MAP.get(m.group(1).lower()[:3], '01')
-        day = m.group(2).zfill(2)
-        year = m.group(3)
-        return f"{day}-{month}-{year}"
-    
-    # Pattern 3: DD/MM/YYYY or DD-MM-YYYY
-    m = re.match(r'(\d{1,2})[-./](\d{1,2})[-./](\d{2,4})', date_str)
+
+    # DD-MM-YY or DD-MM-YYYY
+    m = re.match(r'(\d{1,2})[-./]\s*(\d{1,2})\s*[-./](\d{2,4})', date_str)
     if m:
         day = m.group(1).zfill(2)
         month = m.group(2).zfill(2)
         year = m.group(3)
         if len(year) == 2:
-            year = '20' + year if int(year) <= 50 else '19' + year
+            year = '20' + year
         return f"{day}-{month}-{year}"
-    
-    # Pattern 4: YYYY-MM-DD (ISO format)
-    m = re.match(r'(\d{4})[-./](\d{1,2})[-./](\d{1,2})', date_str)
-    if m:
-        year = m.group(1)
-        month = m.group(2).zfill(2)
-        day = m.group(3).zfill(2)
-        return f"{day}-{month}-{year}"
-    
+
     return date_str
 
 
 # ─────────────────────────────────────────────
-# 6.  ENHANCED BANK NAME LOOKUP
+# 6.  BANK NAME LOOKUP FROM IFSC
 # ─────────────────────────────────────────────
 
 IFSC_PREFIX_MAP = {
-    # Major Banks
     "HDFC": "HDFC Bank",
     "ICIC": "ICICI Bank",
-    "SBIN": "State Bank of India",
+    "SBIN": "SBI",
     "AXIS": "Axis Bank",
     "KKBK": "Kotak Mahindra Bank",
     "BKID": "Bank of India",
@@ -737,32 +471,17 @@ IFSC_PREFIX_MAP = {
     "UTIB": "Axis Bank",
     "YESB": "Yes Bank",
     "RATN": "RBL Bank",
-    "BDBL": "Bandhan Bank",
-    "FDRL": "Federal Bank",
+    "BANDL": "Bandhan Bank",
+    "FDCB": "Federal Bank",
     "SIBL": "South Indian Bank",
-    "KVBL": "Karur Vysya Bank",
-    "TMBL": "Tamilnad Mercantile Bank",
+    "KVBL": "KVB Bank",
+    "TMBL": "TMB Bank",
     "CITI": "Citibank",
     "HSBC": "HSBC",
-    "SCBL": "Standard Chartered Bank",
-    "DBSS": "DBS Bank",
-    "IOBA": "Indian Overseas Bank",
-    "IDIB": "Indian Bank",
-    "MAHB": "Bank of Maharashtra",
-    "UCBA": "UCO Bank",
-    "CBIN": "Central Bank of India",
-    "ALLA": "Allahabad Bank",
-    "CORP": "Corporation Bank",
-    "ANDB": "Andhra Bank",
-    "VIJB": "Vijaya Bank",
-    "AIRP": "Airtel Payments Bank",
-    "PYTM": "Paytm Payments Bank",
-    "JIOP": "Jio Payments Bank",
 }
 
 
 def derive_bank_name(ifsc):
-    """Enhanced bank name derivation from IFSC code."""
     if not ifsc or len(ifsc) < 4:
         return ""
     prefix = ifsc[:4].upper()
@@ -770,627 +489,366 @@ def derive_bank_name(ifsc):
 
 
 # ─────────────────────────────────────────────
-# 7.  ENHANCED VALIDATION ENGINE
+# 7.  VALIDATION ENGINE  —  cross-field checks
+#     after all entities are extracted
 # ─────────────────────────────────────────────
 
 def validate_extraction(record):
     """
-    Comprehensive cross-field validation with detailed warnings.
+    Cross-field validation.  Returns a list of warning strings.
     """
     warnings = []
-    errors = []
 
-    # Critical validations
-    if not record.get("Party name"):
-        errors.append("⚠️ CRITICAL: Party name not detected")
-    
-    if not record.get("Invoice Date"):
-        errors.append("⚠️ CRITICAL: Invoice date not detected")
-    
-    if not record.get("Amount"):
-        errors.append("⚠️ CRITICAL: Amount not detected")
-
-    # Banking detail validations
-    has_account = bool(record.get("Bank Account No"))
-    has_ifsc = bool(record.get("IFSC Code"))
-    has_amount = bool(record.get("Amount"))
-
-    if has_amount and not has_account:
+    # Amount present but no account number
+    if record.get("Amount") and not record.get("Bank Account No"):
         warnings.append("Amount found but no Bank Account Number detected")
-    
-    if has_account and not has_ifsc:
+
+    # Account number present but no IFSC
+    if record.get("Bank Account No") and not record.get("IFSC Code"):
         warnings.append("Account Number found but no IFSC Code detected")
-    
-    if has_ifsc and not has_account:
-        warnings.append("IFSC Code found but no Account Number detected")
 
-    # Invoice number validation
+    # Invoice number looks suspiciously like a phone/account number (too long)
     inv = record.get("Invoice No.", "")
-    if inv:
-        if len(inv) > 12:
-            warnings.append(f"Invoice No. '{inv}' is unusually long — may be misclassified")
-        if inv.isdigit() and len(inv) == 10:
-            warnings.append(f"Invoice No. '{inv}' looks like a phone number")
-    else:
-        warnings.append("Invoice Number not detected")
+    if inv and len(inv) > 7:
+        warnings.append(f"Invoice No. '{inv}' is unusually long — may be misclassified")
 
-    # Phone number validation
-    phone = record.get("Phone Number", "")
-    if phone and len(re.sub(r'[^\d]', '', phone)) != 10:
-        warnings.append(f"Phone Number '{phone}' has unusual length")
+    # No party name
+    if not record.get("Party name"):
+        warnings.append("Party name could not be detected")
 
-    # PAN/GST validation
-    if not record.get("PAN Number / GST"):
-        warnings.append("PAN/GST not detected")
+    # No invoice date
+    if not record.get("Invoice Date"):
+        warnings.append("Invoice Date could not be detected")
 
-    # Amount validation
-    amount = record.get("Amount", "")
-    if amount:
-        try:
-            amt_val = float(amount)
-            if amt_val < 1:
-                warnings.append(f"Amount {amt_val} seems too small")
-            if amt_val > 10000000:  # 1 crore
-                warnings.append(f"Amount {amt_val} is very large — please verify")
-        except ValueError:
-            warnings.append(f"Amount '{amount}' is not a valid number")
+    # Amount is 0 or missing
+    if not record.get("Amount"):
+        warnings.append("Amount could not be detected")
 
-    return errors + warnings
+    return warnings
 
 
 def parse_inline_bank_details(text):
     """
-    Enhanced parsing for inline bank details with multiple formats:
-    - Comma-separated: 'NAME - X, BANK NAME - Y, ACCOUNT - Z'
-    - Colon-separated: 'Bank Name: X, Account No: Y'
-    - Mixed formats
+    Handles the single-line comma-separated bank detail format:
+      'Your Bank details: NAME - CHETAN ANAND, BANK NAME - AXIS BANK,
+       BANK ACCOUNT NO - 918010048531255, IFSC CODE - UTIB0000378'
+
+    Returns a dict with any fields found: account_no, ifsc, bank_name
     """
     result = {}
-    
+
+    # Find the line that contains inline bank details
+    # Trigger: 'Bank details' or 'Your Bank' followed by multiple KEY - VALUE pairs
     for line in text.split("\n"):
-        line_lower = line.lower()
-        
-        if not any(kw in line_lower for kw in ['bank', 'account', 'ifsc']):
+        if not re.search(r'bank\s+(details|account)', line, re.IGNORECASE):
             continue
-        
-        # Account number patterns
-        patterns = [
-            r'(?:bank\s+)?account\s+(?:no|number|#)?\s*[:–—-]\s*(\d{9,18})',
-            r'a/?c\s+(?:no|number)?\s*[:–—-]\s*(\d{9,18})',
-            r'acc\s*[:–—-]\s*(\d{9,18})',
-        ]
-        for pattern in patterns:
-            m = re.search(pattern, line, re.IGNORECASE)
-            if m:
-                result["account_no"] = m.group(1).strip()
-                break
-        
-        # IFSC code patterns
-        patterns = [
-            r'ifsc\s*(?:code)?\s*[:–—-]\s*([A-Z]{4}[0-9A-Z]{7})',
-            r'rtgs\s*(?:code)?\s*[:–—-]\s*([A-Z]{4}[0-9A-Z]{7})',
-        ]
-        for pattern in patterns:
-            m = re.search(pattern, line, re.IGNORECASE)
-            if m:
-                result["ifsc"] = m.group(1).upper().strip()
-                break
-        
-        # Bank name patterns
-        patterns = [
-            r'bank\s+name\s*[:–—-]\s*([A-Za-z\s&]+?)(?:,|$|\|)',
-            r'bank\s*[:–—-]\s*([A-Za-z\s&]+?)(?:,|$|\|)',
-        ]
-        for pattern in patterns:
-            m = re.search(pattern, line, re.IGNORECASE)
-            if m:
-                bank_name = m.group(1).strip()
-                if len(bank_name) > 2:
-                    result["bank_name"] = bank_name
-                break
-        
-        # If we found critical info, we can stop
-        if "account_no" in result or "ifsc" in result:
+
+        # Account number: BANK ACCOUNT NO - <digits>
+        m = re.search(r'BANK\s+ACCOUNT\s+NO\s*[-–—:]\s*(\d{9,18})', line, re.IGNORECASE)
+        if m:
+            result["account_no"] = m.group(1).strip()
+
+        # IFSC: IFSC CODE - <code>
+        m = re.search(r'IFSC\s*(?:CODE)?\s*[-–—:]\s*([A-Z]{4}\d{7})', line, re.IGNORECASE)
+        if m:
+            result["ifsc"] = m.group(1).upper().strip()
+
+        # Bank name: BANK NAME - <name> (up to next comma or end)
+        m = re.search(r'BANK\s+NAME\s*[-–—:]\s*([A-Za-z\s]+?)(?:,|$)', line, re.IGNORECASE)
+        if m:
+            result["bank_name"] = m.group(1).strip()
+
+        # If we found at least account or IFSC, no need to check other lines
+        if result:
             break
-    
+
     return result
-
-
-# ─────────────────────────────────────────────
-# 8.  MAIN EXTRACTION PIPELINE
-# ─────────────────────────────────────────────
 
 def extract_invoice_data(pdf_file, debug_mode=False):
     """
-    Enhanced full pipeline with comprehensive error handling and fallbacks.
+    Full pipeline:
+      PDF → Text Extract → Tokenize → NLP Score → Validate → Record
     """
-    debug_info = ""
-    
     try:
         with pdfplumber.open(pdf_file) as pdf:
             full_text = ""
             all_tables = []
-            page_count = len(pdf.pages)
 
-            # Extract text and tables from all pages
-            for page_num, page in enumerate(pdf.pages, 1):
-                try:
-                    page_text = page.extract_text()
-                    if page_text:
-                        full_text += f"\n--- PAGE {page_num} ---\n{page_text}\n"
-                    
-                    tables = page.extract_tables()
-                    if tables:
-                        all_tables.extend(tables)
-                except Exception as e:
-                    logger.warning(f"Error extracting page {page_num}: {str(e)}")
-                    continue
+            for page in pdf.pages:
+                page_text = page.extract_text()
+                if page_text:
+                    full_text += page_text + "\n"
+                tables = page.extract_tables()
+                if tables:
+                    all_tables.extend(tables)
 
             if not full_text.strip():
-                return None, ["No text extracted — PDF may be image-based or corrupted"], "", ""
+                return None, ["No text extracted — PDF may be scanned/image-based"], ""
 
-            lines = full_text.split("\n")
-            
             # ── Tokenize ──
-            try:
-                tokens = tokenize(full_text, context_window=6)
-            except Exception as e:
-                return None, [f"Tokenization error: {str(e)}"], "", full_text
+            tokens = tokenize(full_text, context_window=5)
 
             # ── NLP Entity Detection ──
-            try:
-                ifsc_candidates = find_entity(tokens, "IFSC")
-                pan_candidates = find_entity(tokens, "PAN")
-                gst_candidates = find_entity(tokens, "GST")
-                acc_candidates = find_entity(tokens, "ACCOUNT_NUMBER")
-                inv_candidates = find_entity(tokens, "INVOICE_NUMBER")
-                date_candidates = find_entity(tokens, "DATE")
-                amount_candidates = find_entity(tokens, "AMOUNT")
-                phone_candidates = find_entity(tokens, "PHONE_NUMBER")
-                email_candidates = find_entity(tokens, "EMAIL")
-            except Exception as e:
-                return None, [f"Entity detection error: {str(e)}"], "", full_text
+            ifsc_candidates = find_entity(tokens, "IFSC")
+            pan_candidates = find_entity(tokens, "PAN")
+            gst_candidates = find_entity(tokens, "GST")
+            acc_candidates = find_entity(tokens, "ACCOUNT_NUMBER")
+            inv_candidates = find_entity(tokens, "INVOICE_NUMBER")
+            date_candidates = find_entity(tokens, "DATE")
+            amount_candidates = find_entity(tokens, "AMOUNT")
+            phone_candidates = find_entity(tokens, "PHONE_NUMBER")
 
-            # ── Select Best Candidates ──
-            
-            # IFSC Code
-            ifsc = ""
-            if ifsc_candidates:
-                ifsc = ifsc_candidates[0][0].text.upper().strip()
-                # Validate format
-                if not re.match(r'^[A-Z]{4}[0-9A-Z]{7}$', ifsc):
-                    ifsc = ""
-            
-            # PAN Number
-            pan = ""
-            if pan_candidates:
-                pan = pan_candidates[0][0].text.upper().strip()
-                if not re.match(r'^[A-Z]{5}\d{4}[A-Z]$', pan):
-                    pan = ""
-            
-            # GST Number
-            gst = ""
-            if gst_candidates:
-                gst = gst_candidates[0][0].text.upper().strip()
-                if len(gst) != 15:
-                    gst = ""
-            
-            # Invoice Number (must not match account number)
-            inv_no = ""
-            if inv_candidates:
-                for tok, score in inv_candidates:
-                    candidate = tok.text.strip()
-                    # Ensure it's not an account number or phone number
-                    if len(candidate) <= 12 and candidate not in [t[0].text.strip() for t in acc_candidates]:
-                        inv_no = candidate
-                        break
-            
-            # Account Number (must not be invoice number)
+            # ── Pick best candidate per field ──
+            ifsc = ifsc_candidates[0][0].text.upper().strip() if ifsc_candidates else ""
+            pan = pan_candidates[0][0].text.upper().strip() if pan_candidates else ""
+            gst = gst_candidates[0][0].text.upper().strip() if gst_candidates else ""
+
+            # Account number: must not be the same as invoice number candidate
+            inv_no = inv_candidates[0][0].text.strip() if inv_candidates else ""
             acc_no = ""
-            if acc_candidates:
-                for tok, score in acc_candidates:
-                    candidate = tok.text.strip()
-                    if candidate != inv_no and 9 <= len(candidate) <= 18:
-                        acc_no = candidate
-                        break
-            
-            # Invoice Date
-            inv_date = ""
-            if date_candidates:
-                inv_date = normalize_date(date_candidates[0][0].text.strip())
-            
-            # Amount (prefer NLP, fallback to table)
+            for tok, sc in acc_candidates:
+                if tok.text.strip() != inv_no:
+                    acc_no = tok.text.strip()
+                    break
+
+            # Date: normalize the best candidate
+            inv_date = normalize_date(date_candidates[0][0].text.strip()) if date_candidates else ""
+
+            # Amount: prefer NLP candidate, fall back to table extraction
             amount = ""
             if amount_candidates:
-                for tok, score in amount_candidates:
-                    raw = re.sub(r'[^\d.]', '', tok.text.strip())
-                    try:
-                        if float(raw) >= 1:
-                            amount = raw
-                            # Ensure .00 if no decimals
-                            if '.' not in amount:
-                                amount = f"{amount}.00"
-                            break
-                    except ValueError:
-                        continue
-            
-            # Fallback to table extraction
+                raw = amount_candidates[0][0].text.strip().replace(',', '')
+                try:
+                    if float(raw) >= 10:
+                        amount = raw
+                except ValueError:
+                    pass
+
             if not amount and all_tables:
                 amount, _ = extract_amount_from_tables(all_tables)
-            
-            # Party Name
+
+            # Party name (specialized extractor)
             party_name, _ = extract_party_name(full_text, tokens)
-            
-            # Phone Number
+
+            # Phone number: pick best candidate, must not collide with account number
             phone_no = ""
-            if phone_candidates:
-                for tok, score in phone_candidates:
-                    candidate = re.sub(r'[^\d]', '', tok.text.strip())
-                    if len(candidate) == 10 and candidate != acc_no:
-                        phone_no = candidate
-                        break
-            
-            # Email
-            email = ""
-            if email_candidates:
-                email = email_candidates[0][0].text.strip()
-            
-            # ── Inline Bank Details Fallback ──
+            for tok, sc in phone_candidates:
+                if tok.text.strip() != acc_no:
+                    phone_no = tok.text.strip()
+                    break
+
+            # ── Inline bank details fallback ──
+            # Handles format like: "NAME - X, BANK NAME - Y, BANK ACCOUNT NO - Z, IFSC CODE - W"
+            # Only fills in fields that NLP missed
             inline_bank = parse_inline_bank_details(full_text)
             if not acc_no and inline_bank.get("account_no"):
                 acc_no = inline_bank["account_no"]
             if not ifsc and inline_bank.get("ifsc"):
                 ifsc = inline_bank["ifsc"]
-            
+
             # PAN/GST preference
             pan_gst = pan if pan else gst
-            
-            # Bank Name
+
+            # Bank name from IFSC (or from inline parser if IFSC missing)
             bank_name = derive_bank_name(ifsc)
             if not bank_name and inline_bank.get("bank_name"):
                 bank_name = inline_bank["bank_name"]
-            
-            # Address (new field)
-            address = extract_address(full_text, lines)
-            
-            # ── Build Record ──
+
             record = {
                 "Party name": party_name,
                 "Invoice Date": inv_date,
                 "Invoice No.": inv_no,
                 "Amount": amount,
                 "Phone Number": phone_no,
-                "Email": email,
-                "Address": address,
                 "Bank Name": bank_name,
                 "Bank Account No": acc_no,
                 "IFSC Code": ifsc,
                 "PAN Number / GST": pan_gst,
             }
-            
+
             # ── Validate ──
             warnings = validate_extraction(record)
-            
-            # ── Debug Info ──
+
+            # ── Debug info ──
+            debug_info = ""
             if debug_mode:
-                debug_info = f"""
-=== EXTRACTION DEBUG INFO ===
-PDF Pages: {page_count}
-Total Text Length: {len(full_text)} chars
-Tokens Generated: {len(tokens)}
+                debug_info = (
+                    f"--- IFSC candidates: {[(t.text, s) for t, s in ifsc_candidates]}\n"
+                    f"--- PAN  candidates: {[(t.text, s) for t, s in pan_candidates]}\n"
+                    f"--- GST  candidates: {[(t.text, s) for t, s in gst_candidates]}\n"
+                    f"--- Acc  candidates: {[(t.text, s) for t, s in acc_candidates]}\n"
+                    f"--- Inv  candidates: {[(t.text, s) for t, s in inv_candidates]}\n"
+                    f"--- Date candidates: {[(t.text, s) for t, s in date_candidates]}\n"
+                    f"--- Amt  candidates: {[(t.text, s) for t, s in amount_candidates]}\n"
+                    f"--- Phn  candidates: {[(t.text, s) for t, s in phone_candidates]}\n"
+                    f"--- Party name candidates checked in text\n"
+                    f"--- Warnings: {warnings}\n"
+                    f"\n--- RAW TEXT (first 3000 chars) ---\n{full_text[:3000]}"
+                )
 
---- ENTITY CANDIDATES ---
-IFSC: {[(t.text, s) for t, s in ifsc_candidates[:3]]}
-PAN: {[(t.text, s) for t, s in pan_candidates[:3]]}
-GST: {[(t.text, s) for t, s in gst_candidates[:3]]}
-Account: {[(t.text, s) for t, s in acc_candidates[:3]]}
-Invoice#: {[(t.text, s) for t, s in inv_candidates[:3]]}
-Date: {[(t.text, s) for t, s in date_candidates[:3]]}
-Amount: {[(t.text, s) for t, s in amount_candidates[:3]]}
-Phone: {[(t.text, s) for t, s in phone_candidates[:3]]}
-Email: {[(t.text, s) for t, s in email_candidates[:3]]}
-
---- FINAL EXTRACTION ---
-{record}
-
---- VALIDATION WARNINGS ---
-{warnings}
-
---- RAW TEXT (first 4000 chars) ---
-{full_text[:4000]}
-"""
-            
             return record, warnings, debug_info, full_text
-    
+
     except Exception as e:
         import traceback
-        error_trace = traceback.format_exc()
-        logger.error(f"Critical error in extract_invoice_data: {str(e)}\n{error_trace}")
-        return None, [f"Critical Error: {str(e)}"], error_trace, ""
+        return None, [f"Error: {str(e)}\n{traceback.format_exc()}"], "", ""
 
 
 # ─────────────────────────────────────────────
-# 9.  STREAMLIT UI WITH ENHANCEMENTS
+# 9.  STREAMLIT UI
 # ─────────────────────────────────────────────
 
 def main():
-    st.set_page_config(
-        page_title="Advanced Invoice Extractor",
-        layout="wide",
-        initial_sidebar_state="expanded"
-    )
-    
-    st.title("📄 Advanced Invoice PDF → Excel Converter")
-    st.markdown("""
-    Extract structured data from **any invoice format** using advanced NLP and pattern recognition.
-    Supports: Tax invoices, proforma invoices, credit notes, debit notes, and more.
-    """)
-    
-    # Sidebar controls
-    with st.sidebar:
-        st.header("⚙️ Settings")
-        debug_mode = st.checkbox(
-            "🔍 Debug Mode",
-            value=False,
-            help="Show detailed NLP scoring and raw text extraction"
-        )
-        
-        show_confidence = st.checkbox(
-            "📊 Show Confidence Scores",
-            value=False,
-            help="Display confidence scores for each extracted field"
-        )
-        
-        st.markdown("---")
-        st.markdown("### 📝 Extraction Capabilities")
-        st.markdown("""
-        **Supported Fields:**
-        - Party/Company Name
-        - Invoice Number & Date
-        - Amount (with table fallback)
-        - Bank Details (Name, Account, IFSC)
-        - PAN & GST Numbers
-        - Phone, Email, Address
-        
-        **Supported Formats:**
-        - PDF with searchable text
-        - Multi-page invoices
-        - Tables and formatted layouts
-        - Various date formats
-        - Indian and international formats
-        """)
-        
-        st.markdown("---")
-        st.markdown("### ℹ️ Tips")
-        st.markdown("""
-        - Upload clear, text-based PDFs
-        - Scanned images should be OCR'd first
-        - Check validation warnings carefully
-        - Use debug mode for troubleshooting
-        """)
-    
-    # File uploader
+    st.set_page_config(page_title="Invoice PDF → Excel Converter", layout="wide")
+    st.title("📄 Invoice PDF → Excel Converter")
+    st.markdown("Extract structured data from invoice PDFs using offline NLP entity detection.")
+
+    debug_mode = st.sidebar.checkbox("🔍 Debug Mode", value=False,
+                                     help="Show NLP scoring details and raw text")
+
     uploaded_files = st.file_uploader(
-        "📤 Upload Invoice PDFs",
+        "Upload Invoice PDFs",
         type=['pdf'],
         accept_multiple_files=True,
-        help="Select one or more invoice PDFs for batch processing"
+        help="Select one or more PDF invoices"
     )
-    
+
     if not uploaded_files:
-        st.info("👆 Upload invoice PDFs to begin extraction")
-        
-        # Show example
-        with st.expander("📖 See Example"):
+        st.info("👆 Please upload one or more invoice PDFs to get started")
+        # Sidebar info
+        with st.sidebar:
+            st.markdown("### 📝 How It Works")
             st.markdown("""
-            **Example Invoice Fields Extracted:**
-            ```
-            Party name: ACME TRADERS PVT LTD
-            Invoice Date: 15-Jan-2024
-            Invoice No.: INV-2024-001
-            Amount: 125000.00
-            Bank Name: HDFC Bank
-            Bank Account No: 50100123456789
-            IFSC Code: HDFC0001234
-            PAN/GST: AABCA1234E
-            ```
+            1. **Tokenize** — PDF text is split into context-aware tokens
+            2. **Score** — Each token is scored per entity type using format + context signals
+            3. **Validate** — Cross-field checks flag suspicious extractions
+            4. **Export** — Clean data exported to Excel
+            
+            **Supported fields:** Party Name, Invoice No., Date, Amount, Bank Account, IFSC, PAN, GST
+            
+            **Supported date formats:** DD-Mon-YY, DD.MM.YYYY, DD/MM/YYYY
             """)
         return
-    
-    st.success(f"✅ {len(uploaded_files)} file(s) uploaded successfully")
-    
-    # Process button
-    col1, col2, col3 = st.columns([1, 1, 1])
-    with col2:
-        process_btn = st.button(
-            "🚀 Process All Invoices",
-            type="primary",
-            use_container_width=True
-        )
-    
-    if process_btn:
-        with st.spinner("🔄 Processing invoices... This may take a moment."):
+
+    st.success(f"✅ {len(uploaded_files)} PDF(s) uploaded")
+
+    if st.button("🔄 Process Invoices", type="primary"):
+        with st.spinner("Processing invoices..."):
             all_data = []
             all_warnings = {}
             all_raw_texts = {}
             failed_files = []
-            
+
             progress_bar = st.progress(0)
-            status_placeholder = st.empty()
-            
+            status_text = st.empty()
+
             for idx, pdf_file in enumerate(uploaded_files):
-                status_placeholder.info(f"📄 Processing: **{pdf_file.name}** ({idx + 1}/{len(uploaded_files)})")
-                
-                try:
-                    record, warnings, debug_info, raw_text = extract_invoice_data(pdf_file, debug_mode)
-                    
-                    if debug_mode and debug_info:
-                        with st.expander(f"🔍 Debug Details — {pdf_file.name}"):
-                            st.code(debug_info, language="text")
-                    
-                    if record:
-                        # Add filename to record
-                        record["Source File"] = pdf_file.name
-                        all_data.append(record)
-                        
-                        if warnings:
-                            all_warnings[pdf_file.name] = warnings
-                        if raw_text:
-                            all_raw_texts[pdf_file.name] = raw_text
-                    else:
-                        failed_files.append(pdf_file.name)
-                        if warnings:
-                            st.error(f"❌ {pdf_file.name}: {'; '.join(warnings)}")
-                
-                except Exception as e:
+                status_text.text(f"Processing: {pdf_file.name}")
+
+                record, warnings, debug_info, raw_text = extract_invoice_data(pdf_file, debug_mode)
+
+                if debug_mode and debug_info:
+                    with st.expander(f"🔍 Debug — {pdf_file.name}"):
+                        st.text_area("NLP Scores & Raw Text", debug_info, height=400,
+                                     key=f"debug_{idx}")
+
+                if record:
+                    all_data.append(record)
+                    if warnings:
+                        all_warnings[pdf_file.name] = warnings
+                    if raw_text:
+                        all_raw_texts[pdf_file.name] = raw_text
+                else:
                     failed_files.append(pdf_file.name)
-                    st.error(f"❌ {pdf_file.name}: Critical error - {str(e)}")
-                
+                    if warnings:
+                        st.warning(f"⚠️ {pdf_file.name}: {'; '.join(warnings)}")
+
                 progress_bar.progress((idx + 1) / len(uploaded_files))
-            
-            status_placeholder.empty()
-            progress_bar.empty()
-            
-            # ── Display Results ──
-            
+
+            status_text.empty()
+
+            # ── Show validation warnings ──
+            if all_warnings:
+                with st.expander("⚠️ Validation Warnings", expanded=True):
+                    for fname, warns in all_warnings.items():
+                        st.markdown(f"**{fname}:**")
+                        for w in warns:
+                            st.markdown(f"  - ⚠️ {w}")
+
             if all_data:
-                st.success(f"✅ Successfully processed **{len(all_data)}** invoice(s)")
-                
-                if failed_files:
-                    st.warning(f"⚠️ Failed to process: {', '.join(failed_files)}")
-                
-                # Show warnings
-                if all_warnings:
-                    with st.expander("⚠️ Validation Warnings & Notices", expanded=True):
-                        for fname, warns in all_warnings.items():
-                            st.markdown(f"**{fname}:**")
-                            for w in warns:
-                                if "CRITICAL" in w:
-                                    st.error(f"  {w}")
-                                else:
-                                    st.warning(f"  {w}")
-                
-                # Display extracted data
-                st.subheader("📊 Extracted Invoice Data")
-                
                 columns = [
-                    "Source File", "Party name", "Invoice Date", "Invoice No.",
-                    "Amount", "Phone Number", "Email", "Address",
-                    "Bank Name", "Bank Account No", "IFSC Code", "PAN Number / GST"
+                    "Party name", "Invoice Date", "Invoice No.", "Amount",
+                    "Phone Number", "Bank Name", "Bank Account No", "IFSC Code",
+                    "PAN Number / GST"
                 ]
-                
                 df = pd.DataFrame(all_data, columns=columns)
-                
-                # Display with formatting
-                st.dataframe(
-                    df,
-                    use_container_width=True,
-                    height=400
-                )
-                
-                # Statistics
-                col1, col2, col3, col4 = st.columns(4)
-                with col1:
-                    st.metric("Total Invoices", len(all_data))
-                with col2:
-                    complete = sum(1 for r in all_data if r.get("Amount") and r.get("Party name"))
-                    st.metric("Complete Records", complete)
-                with col3:
-                    with_warnings = len(all_warnings)
-                    st.metric("With Warnings", with_warnings)
-                with col4:
-                    st.metric("Failed", len(failed_files))
-                
+
+                st.success(f"✅ Successfully processed {len(all_data)} invoice(s)")
+                if failed_files:
+                    st.warning(f"⚠️ Failed: {', '.join(failed_files)}")
+
+                st.subheader("📊 Extracted Data")
+                st.dataframe(df, use_container_width=True)
+
                 # ── Excel Export ──
-                st.markdown("---")
-                st.subheader("💾 Export Options")
-                
                 output = BytesIO()
                 with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                    # Main data sheet
                     df.to_excel(writer, index=False, sheet_name='Invoices')
+
                     ws = writer.sheets['Invoices']
-                    
-                    # Auto-adjust column widths
                     for col_idx, col_name in enumerate(columns):
                         max_len = max(
                             df[col_name].astype(str).apply(len).max(),
                             len(col_name)
-                        ) + 3
-                        col_letter = chr(65 + col_idx) if col_idx < 26 else f"A{chr(65 + col_idx - 26)}"
-                        ws.column_dimensions[col_letter].width = min(max_len, 60)
-                    
-                    # Warnings sheet
+                        ) + 2
+                        col_letter = chr(65 + col_idx)
+                        ws.column_dimensions[col_letter].width = min(max_len, 50)
+
+                    # Add warnings sheet if any exist
                     if all_warnings:
                         warn_rows = []
                         for fname, warns in all_warnings.items():
                             for w in warns:
-                                warn_rows.append({
-                                    "File": fname,
-                                    "Warning Type": "CRITICAL" if "CRITICAL" in w else "INFO",
-                                    "Message": w
-                                })
+                                warn_rows.append({"File": fname, "Warning": w})
                         warn_df = pd.DataFrame(warn_rows)
                         warn_df.to_excel(writer, index=False, sheet_name='Warnings')
                         ws2 = writer.sheets['Warnings']
-                        ws2.column_dimensions['A'].width = 40
-                        ws2.column_dimensions['B'].width = 15
-                        ws2.column_dimensions['C'].width = 80
-                
+                        ws2.column_dimensions['A'].width = 35
+                        ws2.column_dimensions['B'].width = 60
+
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                
-                col1, col2 = st.columns(2)
-                with col1:
+                st.download_button(
+                    label="⬇️ Download Excel File",
+                    data=output.getvalue(),
+                    file_name=f"invoices_{timestamp}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True
+                )
+
+                # If there were warnings, offer a debug text file download
+                if all_warnings and all_raw_texts:
+                    debug_txt = ""
+                    for fname, raw in all_raw_texts.items():
+                        debug_txt += f"{'='*60}\n"
+                        debug_txt += f"FILE: {fname}\n"
+                        debug_txt += f"{'='*60}\n"
+                        debug_txt += raw + "\n\n"
                     st.download_button(
-                        label="📥 Download Excel File",
-                        data=output.getvalue(),
-                        file_name=f"invoices_{timestamp}.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        label="⬇️ Download Debug Text (for troubleshooting)",
+                        data=debug_txt,
+                        file_name=f"debug_raw_text_{timestamp}.txt",
+                        mime="text/plain",
                         use_container_width=True
                     )
-                
-                # Debug text export
-                if all_raw_texts and (debug_mode or all_warnings):
-                    with col2:
-                        debug_txt = ""
-                        for fname, raw in all_raw_texts.items():
-                            debug_txt += f"{'='*70}\n"
-                            debug_txt += f"FILE: {fname}\n"
-                            debug_txt += f"{'='*70}\n"
-                            debug_txt += raw + "\n\n"
-                        
-                        st.download_button(
-                            label="📝 Download Debug Text",
-                            data=debug_txt,
-                            file_name=f"debug_raw_text_{timestamp}.txt",
-                            mime="text/plain",
-                            use_container_width=True
-                        )
-            
             else:
-                st.error("❌ No data could be extracted from any uploaded PDFs")
-                st.info("""
-                **Possible reasons:**
-                - PDFs are image-based (need OCR)
-                - PDFs are corrupted or password-protected
-                - Invoice format is highly non-standard
-                
-                **Solutions:**
-                - Use OCR software to convert scanned PDFs to searchable text
-                - Ensure PDFs are not password-protected
-                - Try debug mode to see what was extracted
-                """)
-    
+                st.error("❌ No data could be extracted from any uploaded PDFs.")
+                st.info("💡 Make sure PDFs are text-based (not scanned images).")
+
     # Footer
     st.markdown("---")
-    st.markdown("""
-    <div style='text-align: center; color: #666;'>
-    <small>
-    <b>Pipeline:</b> PDF → Text Extraction → Enhanced Tokenization → NLP Entity Scoring → 
-    Multi-Pattern Matching → Cross-Field Validation → Excel Export
-    </small>
-    </div>
-    """, unsafe_allow_html=True)
+    st.markdown(
+        "**Pipeline:** PDF → Text Extract → Tokenize → NLP Entity Scoring → "
+        "Cross-Field Validation → Excel Output"
+    )
 
 
 if __name__ == "__main__":
