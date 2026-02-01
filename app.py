@@ -606,11 +606,11 @@ def extract_invoice_data(pdf_file, debug_mode=False):
                     f"\n--- RAW TEXT (first 3000 chars) ---\n{full_text[:3000]}"
                 )
 
-            return record, warnings, debug_info
+            return record, warnings, debug_info, full_text
 
     except Exception as e:
         import traceback
-        return None, [f"Error: {str(e)}\n{traceback.format_exc()}"], ""
+        return None, [f"Error: {str(e)}\n{traceback.format_exc()}"], "", ""
 
 
 # ─────────────────────────────────────────────
@@ -655,6 +655,7 @@ def main():
         with st.spinner("Processing invoices..."):
             all_data = []
             all_warnings = {}
+            all_raw_texts = {}
             failed_files = []
 
             progress_bar = st.progress(0)
@@ -663,7 +664,7 @@ def main():
             for idx, pdf_file in enumerate(uploaded_files):
                 status_text.text(f"Processing: {pdf_file.name}")
 
-                record, warnings, debug_info = extract_invoice_data(pdf_file, debug_mode)
+                record, warnings, debug_info, raw_text = extract_invoice_data(pdf_file, debug_mode)
 
                 if debug_mode and debug_info:
                     with st.expander(f"🔍 Debug — {pdf_file.name}"):
@@ -674,6 +675,8 @@ def main():
                     all_data.append(record)
                     if warnings:
                         all_warnings[pdf_file.name] = warnings
+                    if raw_text:
+                        all_raw_texts[pdf_file.name] = raw_text
                 else:
                     failed_files.append(pdf_file.name)
                     if warnings:
@@ -740,6 +743,22 @@ def main():
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     use_container_width=True
                 )
+
+                # If there were warnings, offer a debug text file download
+                if all_warnings and all_raw_texts:
+                    debug_txt = ""
+                    for fname, raw in all_raw_texts.items():
+                        debug_txt += f"{'='*60}\n"
+                        debug_txt += f"FILE: {fname}\n"
+                        debug_txt += f"{'='*60}\n"
+                        debug_txt += raw + "\n\n"
+                    st.download_button(
+                        label="⬇️ Download Debug Text (for troubleshooting)",
+                        data=debug_txt,
+                        file_name=f"debug_raw_text_{timestamp}.txt",
+                        mime="text/plain",
+                        use_container_width=True
+                    )
             else:
                 st.error("❌ No data could be extracted from any uploaded PDFs.")
                 st.info("💡 Make sure PDFs are text-based (not scanned images).")
